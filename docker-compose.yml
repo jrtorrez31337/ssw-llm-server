@@ -1,0 +1,187 @@
+services:
+  # === Redis: request queue + response pub/sub ===
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # === GPU 0: Heavy worker (Qwen2.5-14B-Instruct-AWQ) ===
+  heavy-0:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=/models/${HEAVY_MODEL}
+      - --served-model-name=heavy
+      - --port=8000
+      - --gpu-memory-utilization=${HEAVY_GPU_MEMORY_UTILIZATION}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN}
+      - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
+      - --enable-auto-tool-choice
+      - --dtype=half
+      - --quantization=awq
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+    ports:
+      - "127.0.0.1:${HEAVY_0_PORT}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # === GPU 0: Light worker (Qwen3-8B-AWQ) ===
+  light-0:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=/models/${LIGHT_MODEL}
+      - --served-model-name=light
+      - --port=8000
+      - --gpu-memory-utilization=${LIGHT_GPU_MEMORY_UTILIZATION}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN}
+      - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
+      - --enable-auto-tool-choice
+      - --dtype=half
+      - --quantization=awq
+
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+    ports:
+      - "127.0.0.1:${LIGHT_0_PORT}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    depends_on:
+      heavy-0:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # === GPU 1: Heavy worker (Qwen2.5-14B-Instruct-AWQ) ===
+  heavy-1:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=/models/${HEAVY_MODEL}
+      - --served-model-name=heavy
+      - --port=8000
+      - --gpu-memory-utilization=${HEAVY_GPU_MEMORY_UTILIZATION}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN}
+      - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
+      - --enable-auto-tool-choice
+      - --dtype=half
+      - --quantization=awq
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+    ports:
+      - "127.0.0.1:${HEAVY_1_PORT}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # === GPU 1: Light worker (Qwen3-8B-AWQ) ===
+  light-1:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=/models/${LIGHT_MODEL}
+      - --served-model-name=light
+      - --port=8000
+      - --gpu-memory-utilization=${LIGHT_GPU_MEMORY_UTILIZATION}
+      - --max-model-len=${VLLM_MAX_MODEL_LEN}
+      - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
+      - --enable-auto-tool-choice
+      - --dtype=half
+      - --quantization=awq
+
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+    ports:
+      - "127.0.0.1:${LIGHT_1_PORT}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    depends_on:
+      heavy-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # === API Gateway ===
+  gateway:
+    build: ./gateway
+    ports:
+      - "0.0.0.0:${GATEWAY_PORT:-8000}:8000"
+    environment:
+      - GATEWAY_HEAVY_WORKERS=http://heavy-0:8000,http://heavy-1:8000
+      - GATEWAY_LIGHT_WORKERS=http://light-0:8000,http://light-1:8000
+      - GATEWAY_REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      heavy-0:
+        condition: service_healthy
+      light-0:
+        condition: service_healthy
+      heavy-1:
+        condition: service_healthy
+      light-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  redis-data:
