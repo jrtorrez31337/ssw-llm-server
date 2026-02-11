@@ -24,29 +24,31 @@ Architecture:
 ```
 Clients (OpenAI SDK compatible)
   │
-  ▼
-API Gateway (FastAPI)  ─── /v1/chat/completions
-  │
-  │  routes by model field or header:
-  │  "heavy" → 14B queue    "light" → 8B queue
+  POST /v1/chat/completions  (model: "heavy" or "light")
   │
   ▼
-Redis (2 queues + response pub/sub channels)
+FastAPI Gateway (:8000)  ─── 0.0.0.0, accepts remote clients
   │
-  ├──► Worker 0: Qwen2.5-14B-Instruct-AWQ  (GPU 0)
-  ├──► Worker 1: Qwen3-8B-AWQ              (GPU 0)
-  ├──► Worker 2: Qwen2.5-14B-Instruct-AWQ  (GPU 1)
-  └──► Worker 3: Qwen3-8B-AWQ              (GPU 1)
+  ├─ model="heavy" → round-robin [heavy-0, heavy-1]  (Qwen2.5-14B-Instruct-AWQ)
+  └─ model="light" → round-robin [light-0, light-1]  (Qwen3-8B-AWQ)
+       │
+       ▼
+  vLLM Workers (continuous batching, tool calling)
+       │
+  Redis ← request metrics (latency, tokens, errors)
 ```
 
 Design Decisions (LOCKED):
 - Serving engine: vLLM
 - Models: Qwen2.5-14B-Instruct-AWQ (heavy) + Qwen3-8B-AWQ (light)
-- Queue broker: Redis (decouples ingestion from processing, absorbs bursts)
+- Routing: direct HTTP proxy with round-robin across healthy workers per pool
+- Burst handling: vLLM's continuous batcher absorbs concurrency natively
+- Redis role: metrics storage only (latency, tokens, error tracking) — not a request queue
 - API contract: OpenAI-compatible /v1/chat/completions
-- Routing: smart routing by model field — "heavy" tasks to 14B, "light" tasks to 8B
 - Orchestration: Docker Compose with explicit GPU device assignments
 - Tool calling: --tool-call-parser hermes --enable-auto-tool-choice (both models)
+- Thinking suppression: Qwen3 light model requests inject enable_thinking=false
+- Worker failover: gateway retries next healthy worker on connection failure
 
 Model Specs:
 - Qwen2.5-14B-Instruct-AWQ: ~9GB VRAM weights, official Qwen AWQ quant, Apache 2.0
@@ -59,12 +61,12 @@ GPU Allocation:
 - GPU 1: 1x 14B replica (~9GB) + 1x 8B replica (~6GB) = ~15GB weights + KV cache
 - Remaining ~33GB per GPU available for KV cache and overhead
 
-Implementation Phases:
-1. Foundation — project scaffold, Docker Compose, GPU assignments, Redis
-2. vLLM Workers — containerized workers for both models, health checks
-3. API Gateway — FastAPI with OpenAI-compatible endpoints, smart routing, Redis queue integration
-4. Observability — queue depth metrics, latency tracking, GPU utilization
-5. Load Testing — benchmark throughput, validate queue absorption under burst
+Implementation Status:
+1. ✅ Foundation — project scaffold, Docker Compose, GPU assignments, Redis
+2. ✅ vLLM Workers — containerized workers for both models, health checks
+3. ✅ API Gateway — FastAPI with OpenAI-compatible endpoints, round-robin routing, metrics
+4. Observability — latency tracking via Redis, GPU utilization (expand)
+5. Load Testing — benchmark throughput, validate continuous batching under burst
 
 ---
 
@@ -77,10 +79,10 @@ ORIENTATION PRINCIPLES
 
 SUCCESS DEFINITION
 You are successful if the platform delivers:
-- High throughput inference with burst absorption via Redis queuing
-- Smart routing between 14B (quality) and 8B (speed) replicas
+- High throughput inference with burst absorption via vLLM continuous batching
+- Smart routing between 14B (quality) and 8B (speed) replicas with automatic failover
 - OpenAI-compatible API that any client can use as a drop-in
-- Observable queue depths, latencies, and GPU utilization
+- Observable latencies, error rates, and token usage via Redis metrics
 - Reproducible deployment via Docker Compose
 
 FAILURE MODE
@@ -142,12 +144,11 @@ Avoid essays unless framing a decision.
 EXPECTED AREAS OF CONTRIBUTION
 
 • vLLM multi-replica serving with AWQ quantized models
-• Redis-based request queuing and response routing
-• FastAPI gateway with OpenAI-compatible API
+• FastAPI gateway with OpenAI-compatible API and direct HTTP proxy
 • Docker Compose orchestration with GPU pinning
-• Load balancing and smart routing (heavy/light)
-• Health checking and automatic worker recovery
-• Metrics, tracing, and queue observability
+• Round-robin load balancing with automatic failover
+• Health checking and worker pool management
+• Metrics and observability via Redis
 • Load testing and capacity validation
 • Model swapping and A/B testing infrastructure
 
