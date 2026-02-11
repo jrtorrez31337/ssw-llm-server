@@ -2,26 +2,31 @@
 
 Open-source LLM inference platform built for **Social Space Wars** — a galaxy-scale MMO where NPC behavior is driven by large language models instead of scripted behavior trees.
 
-This server powers autonomous NPC agents that exhibit emergent social behavior: forming alliances, trading, fighting, developing culture, and making decisions through active inference — all without hardcoded scripts.
+**This repo is the server** — the inference backbone that serves models over an OpenAI-compatible API. The NPC agent logic (memory, doctrine, action selection, context engineering) lives client-side. This server doesn't know or care what the agents do; it just serves tokens fast.
 
-## Research Foundation
+## Why This Exists
 
-This architecture is informed by recent research demonstrating that complex, believable agent behavior emerges from simple building blocks (memory, preferences, action selection) rather than explicit programming:
+The research below shaped the *client-side* agent design for SSW — not this server directly. We include it here for context on what this infrastructure is built to support: large-scale autonomous NPC populations that need reliable, high-throughput inference.
 
-**[Generative Agents: Interactive Simulacra of Human Behavior](https://arxiv.org/abs/2304.03442)** — Park et al. (Stanford/Google, 2023). The Smallville experiment: 25 AI agents in a virtual village developed realistic personalities, social connections, and multi-step plans autonomously. Established that memory + reflection mechanisms are load-bearing for believable NPC behavior.
+**[Generative Agents: Interactive Simulacra of Human Behavior](https://arxiv.org/abs/2304.03442)** — Park et al. (Stanford/Google, 2023). 25 AI agents in a virtual village developed realistic personalities, social connections, and multi-step plans autonomously. Established that memory + reflection mechanisms are load-bearing for believable NPC behavior.
 
-**[Project Sid: Many-Agent Simulations Toward AI Civilization](https://arxiv.org/abs/2411.00114)** — Altera.AL, 2024. Scaled to 1,000+ autonomous agents in Minecraft who created emergent civilization — specialized roles, democratic governance, taxation, and organically spreading culture — all without instruction. Ablation studies confirmed behaviors arose from agent capabilities, not hidden scripts.
+**[Project Sid: Many-Agent Simulations Toward AI Civilization](https://arxiv.org/abs/2411.00114)** — Altera.AL, 2024. 1,000+ autonomous agents in Minecraft created emergent civilization — specialized roles, democratic governance, taxation, and organically spreading culture — all without instruction.
 
-**[ChatDev: Communicative Agents for Software Development](https://arxiv.org/abs/2307.07924)** — Qian et al. (ACL 2024). Multi-agent role specialization where agents with different roles (CEO, developer, tester) coordinate autonomously. Validates doctrine-based conditioning for task specialization in agent systems.
+**[ChatDev: Communicative Agents for Software Development](https://arxiv.org/abs/2307.07924)** — Qian et al. (ACL 2024). Multi-agent role specialization where agents with different roles coordinate autonomously. Validates doctrine-based conditioning for task specialization.
 
-**[Generative Exaggeration in LLM Social Agents](https://arxiv.org/abs/2507.00657)** — 2025. Critical safety research showing agents fabricate emotional understanding beyond evidence. Architectural constraints — not training alone — are necessary to prevent misalignment. Informs our doctrine system design where agent preferences are bounded to in-world outcomes.
+**[Generative Exaggeration in LLM Social Agents](https://arxiv.org/abs/2507.00657)** — 2025. Agents fabricate emotional understanding beyond evidence. Architectural constraints — not training alone — are necessary to prevent misalignment.
 
-### Design Principles Derived from Research
+**[Effective Context Engineering for AI Agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)** — Anthropic Applied AI, 2025. Strategically curating what enters the context window is the key lever for agent reliability. Directly informs how NPC clients structure their requests to this server.
+
+### Client-Side Design Principles (Not Implemented Here)
+
+These principles guide the NPC agents that *call* this server:
 
 - **Emergence over scripting** — Complex NPC behavior arises from simple components (memory, doctrine, action selection), not behavior trees
 - **Doctrine conditioning** — Faction/archetype preference weights shape behavior without explicit rules
 - **Active inference-lite** — NPCs select actions by minimizing prediction error: viability + preferences + information gain
 - **Memory with decay** — Structured memory where older events lose salience, keeping context bounded
+- **Context engineering** — Agents curate what enters the context window to maximize coherence within token budgets
 - **Architectural safety** — Agent preferences are constrained to in-world outcomes; self-preservation cannot become a terminal goal
 
 ## Architecture
