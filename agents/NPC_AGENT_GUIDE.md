@@ -1,229 +1,335 @@
-# SSW NPC Agent — AI Gateway Integration Guide
+# NPC Agent Integration Guide
 
-You are building NPC agents for Social Space Wars that use the SSW AI inference platform for decision-making, dialogue, and behavior generation. This document is your interface contract.
+## Platform Overview
+
+The SSW AI inference platform is accessible at the gateway host on port `8000` via OpenAI-compatible API.
+
+| Tier | Model | Best For |
+|------|-------|----------|
+| `heavy` | Qwen2.5-14B-Instruct-AWQ | Complex reasoning, lore-heavy NPCs, quest-critical dialogue |
+| `light` | Qwen3-8B-AWQ | High-frequency, low-latency interactions, ambient chatter |
+
+**Max context window: 64,000 tokens** (input + output combined)
+**API:** `POST /v1/chat/completions` — fully OpenAI SDK compatible
 
 ---
 
-## Endpoint
+## Token Budget
+
+64K is shared between everything in the request. Design for the common case — most NPC interactions should target **under 8K total** to preserve throughput.
+
+| Zone | Tokens | Contents |
+|------|--------|----------|
+| System prompt | 1,000–3,000 | Persona, world rules, behavioral constraints |
+| World context | 0–8,000 | Zone state, active quest flags, nearby entities |
+| Conversation history | 0–48,000 | Prior turns (or summary — see below) |
+| Player input | 0–2,000 | Current message |
+| Output reserve | 512–4,000 | NPC response |
+
+Reserve the large budget for NPCs that carry long quest arcs or persistent relationships. Don't burn it on ambient interactions.
+
+---
+
+## System Prompt Structure
+
+Use explicit labeled sections. Bullet lists over paragraphs. Dense prose wastes tokens and degrades instruction following.
 
 ```
-POST http://<GATEWAY_HOST>:8000/v1/chat/completions
+IDENTITY
+You are [NPC_NAME], [role in one sentence]. [Personality in one sentence.]
+
+WORLD STATE
+Location: [zone name]
+Faction: [affiliation]
+Active flags: [quest_id: status, ...]
+
+BEHAVIORAL RULES
+- [constraint 1]
+- [constraint 2]
+
+KNOWLEDGE LIMITS
+You know: [what this NPC should know]
+You do not know: [explicit gaps — prevents hallucination]
 ```
 
-The API is **OpenAI-compatible**. Use any OpenAI SDK or raw HTTP.
+**Do:**
+- Put hard constraints before personality
+- Be explicit about knowledge gaps
+- Reference faction/quest state by ID, not prose
+
+**Don't:**
+- Include full lore documents — summarize or chunk
+- Restate world context that's already in message history
+- Use vague descriptors ("friendly," "wise") without behavioral anchors
 
 ---
 
-## Models
+## Model Selection
 
-| Model ID | Backend | Use When |
-|----------|---------|----------|
-| `heavy`  | Qwen2.5-14B-Instruct-AWQ | Complex reasoning, multi-step planning, diplomatic negotiations, lore generation, quest design |
-| `light`  | Qwen3-8B-AWQ | Ambient dialogue, simple reactions, status checks, routine NPC behaviors, high-frequency calls |
+### Use `heavy` when:
+- NPC carries quest-critical information where accuracy matters
+- Multi-step reasoning is required (evaluating player actions, generating consequences)
+- Long-form narrative generation (journal entries, lore reveals)
+- Infrequent, high-value interactions
 
-**Rule of thumb**: if the player won't notice the quality difference, use `light`. It's faster and leaves `heavy` capacity for tasks that matter.
+### Use `light` when:
+- Ambient, flavor, or one-line responses
+- High concurrency (merchants, guards, crowd NPCs)
+- Player is spam-pinging the same NPC
+- Latency matters more than depth
 
----
-
-## Basic Request
-
+### Request format:
 ```json
 {
-  "model": "light",
-  "messages": [
-    {"role": "system", "content": "You are a merchant NPC in a space station..."},
-    {"role": "user", "content": "What do you have for sale?"}
-  ],
-  "max_tokens": 256,
+  "model": "heavy",
+  "messages": [...],
+  "max_tokens": 512,
   "temperature": 0.7
 }
 ```
 
-### Python (OpenAI SDK)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://<GATEWAY_HOST>:8000/v1", api_key="unused")
-
-response = client.chat.completions.create(
-    model="light",
-    messages=[
-        {"role": "system", "content": "You are a merchant NPC..."},
-        {"role": "user", "content": "What do you have for sale?"},
-    ],
-    max_tokens=256,
-    temperature=0.7,
-)
-print(response.choices[0].message.content)
-```
-
-### Python (httpx / raw HTTP)
-
-```python
-import httpx
-
-resp = httpx.post(
-    "http://<GATEWAY_HOST>:8000/v1/chat/completions",
-    json={
-        "model": "heavy",
-        "messages": [{"role": "user", "content": "Analyze threat level of incoming fleet"}],
-        "max_tokens": 512,
-    },
-)
-print(resp.json()["choices"][0]["message"]["content"])
-```
-
 ---
 
-## Streaming
+## Conversation History Management
 
-For real-time dialogue or long outputs, use streaming to get tokens as they generate:
+Don't accumulate raw history indefinitely. KV cache pressure slows inference for all concurrent users.
+
+**Recommended approach: summarize-and-compress**
+
+Trigger when history exceeds ~8K tokens:
 
 ```python
-response = client.chat.completions.create(
+summary = client.chat.completions.create(
     model="light",
-    messages=[...],
-    max_tokens=256,
-    stream=True,
+    messages=[
+        {
+            "role": "system",
+            "content": "Summarize this NPC conversation into key facts, relationship state, and unresolved threads. Max 300 tokens."
+        },
+        {
+            "role": "user",
+            "content": full_history_text
+        }
+    ],
+    max_tokens=300
 )
-for chunk in response:
-    delta = chunk.choices[0].delta.content
-    if delta:
-        print(delta, end="", flush=True)
+# Replace history with: [{"role": "assistant", "content": f"[Prior context]: {summary}"}]
 ```
+
+For persistent NPCs, store structured state (relationship score, known facts, quest flags) in your world DB — not in the conversation history.
 
 ---
 
 ## Tool Calling
 
-Both models support tool/function calling via the Hermes format. Define tools and let the model decide when to invoke them.
+Both models support hermes-format tool calling. The gateway passes tool definitions through unchanged.
+
+```json
+{
+  "model": "heavy",
+  "messages": [...],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "query_world_state",
+        "description": "Query current state for a zone or entity",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "zone_id": {"type": "string", "description": "Zone identifier"},
+            "entity_type": {
+              "type": "string",
+              "enum": ["player", "faction", "quest", "npc"]
+            }
+          },
+          "required": ["zone_id"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
+
+**Note:** The `light` model has thinking mode disabled at the gateway level. Do not attempt to enable it — behavior is undefined and will likely degrade output quality.
+
+---
+
+## Client Example (Python)
 
 ```python
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "scan_sector",
-            "description": "Scan a galactic sector for ships, resources, or anomalies",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sector_id": {"type": "string", "description": "Sector coordinate ID"},
-                    "scan_type": {"type": "string", "enum": ["ships", "resources", "anomalies"]},
-                },
-                "required": ["sector_id", "scan_type"],
-            },
-        },
-    }
-]
+from openai import OpenAI
 
-response = client.chat.completions.create(
-    model="heavy",
-    messages=[{"role": "user", "content": "Check sector G-7 for hostile ships"}],
-    tools=tools,
-    tool_choice="auto",
+client = OpenAI(
+    base_url="http://<gateway-host>:8000/v1",
+    api_key="not-used"  # internal network, no auth
 )
 
-msg = response.choices[0].message
-if msg.tool_calls:
-    for call in msg.tool_calls:
-        print(f"Call: {call.function.name}({call.function.arguments})")
+response = client.chat.completions.create(
+    model="light",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "IDENTITY\n"
+                "You are Mira, a dockworker in Port Veluna. You trade gossip for coin.\n\n"
+                "BEHAVIORAL RULES\n"
+                "- Stay in character\n"
+                "- Do not break immersion\n"
+                "- You have never heard of the Inner Sanctum\n\n"
+                "KNOWLEDGE LIMITS\n"
+                "You know: shipping schedules, dock crew names, recent arrivals\n"
+                "You do not know: anything about the player's quest, inner city politics"
+            )
+        },
+        {
+            "role": "user",
+            "content": "Have you seen any strange ships lately?"
+        }
+    ],
+    max_tokens=256,
+    temperature=0.8
+)
+
+print(response.choices[0].message.content)
 ```
 
-After executing the tool, send the result back:
-
+Streaming:
 ```python
-messages.append(msg)  # assistant message with tool_calls
-messages.append({
-    "role": "tool",
-    "tool_call_id": call.id,
-    "content": '{"ships": [{"id": "X-42", "class": "destroyer", "hostile": true}]}',
-})
-# Then call completions again for the model to interpret the result
+stream = client.chat.completions.create(
+    model="heavy",
+    messages=[...],
+    max_tokens=1024,
+    stream=True
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
 ---
 
-## Model Selection Guidelines
+## Quick Reference
 
-### Use `heavy` for:
-- Multi-turn strategic reasoning (fleet commander AI, faction leader diplomacy)
-- Content generation (quest narratives, item descriptions, lore entries)
-- Complex tool-calling chains (multi-step plans with 3+ tool invocations)
-- Situations where coherence across a long context window matters
-
-### Use `light` for:
-- Single-turn NPC barks and ambient dialogue
-- Simple decisions (fight/flee, buy/sell, patrol/idle)
-- High-frequency background agent ticks (economy bots, patrol AI)
-- Any call where latency matters more than depth
-
-### Anti-patterns
-- Do NOT send `heavy` requests for one-line NPC dialogue — wastes capacity
-- Do NOT set `max_tokens` higher than you need — longer generation = longer latency
-- Do NOT poll in tight loops — batch or debounce your requests
-- Do NOT include the entire game state in every message — send only what the NPC needs to know
+| Parameter | Value |
+|-----------|-------|
+| Max context (input + output) | 64,000 tokens |
+| Safe max input | ~60,000 tokens |
+| Recommended output reserve | 512–2,048 tokens |
+| Gateway endpoint | `:8000/v1/chat/completions` |
+| Available models | `heavy`, `light` |
+| Streaming | Supported (`"stream": true`) |
+| Authentication | None (internal network) |
+| Tool calling | Supported (hermes format, both models) |
 
 ---
 
-## Request Parameters Reference
+## Performance & Latency
 
-| Parameter | Type | Default | Notes |
-|-----------|------|---------|-------|
-| `model` | string | required | `"heavy"` or `"light"` |
-| `messages` | array | required | OpenAI message format |
-| `max_tokens` | int | model default | Keep as low as practical |
-| `temperature` | float | 1.0 | 0.3-0.5 for deterministic, 0.7-1.0 for creative |
-| `top_p` | float | 1.0 | Alternative to temperature — don't use both |
-| `stream` | bool | false | Enable SSE streaming |
-| `tools` | array | none | Tool/function definitions |
-| `tool_choice` | string/object | "auto" | `"auto"`, `"none"`, or specific function |
-| `stop` | string/array | none | Stop sequences |
+### Expected Latency (awq_marlin kernel active)
+
+| Model | Prompt Size | Expected P50 |
+|-------|-------------|--------------|
+| `light` (8B) | ~4K tokens | 8–12s |
+| `light` (8B) | ~8K tokens | 12–18s |
+| `heavy` (14B) | ~4K tokens | 15–20s |
+| `heavy` (14B) | ~8K tokens | 20–30s |
+
+If you observe P50 > 30s, the Marlin kernel may not be active. Check worker startup logs for:
+```
+Detected that the model can run with awq_marlin
+```
+If present, ensure `--quantization=awq_marlin` is set (not `--quantization=awq`).
+
+### Route by Decision Type
+
+**Use `light` for:**
+- All navigation decisions (`course.*`, `navigate.*`, `scan.*`, `warp.*`)
+- Ambient actions with no player interaction
+- High-frequency ticks
+
+**Use `heavy` for:**
+- Player-facing dialogue where quality matters
+- Quest-critical reasoning or lore reveals
+- Tool calls that require multi-step logic
+
+Routing navigation to `heavy` when `light` suffices doubles your latency for no gain.
 
 ---
 
-## Health & Diagnostics
+## Action Sequences & Lifecycles
 
-```bash
-# Gateway health (are workers up?)
-curl http://<GATEWAY_HOST>:8000/health
+Actions are not self-completing — many require a follow-up action in the next tick to take effect. Failing to complete a sequence causes stuck behavior.
 
-# Available models
-curl http://<GATEWAY_HOST>:8000/v1/models
+### Navigation (travel to a destination)
+```
+course.set_destination  →  course.engage  →  [in transit]  →  next decision
+```
+**Never** repeat `course.set_destination` without first calling `course.engage`. Setting a destination does not start movement.
 
-# Request metrics (counts, latencies, error rates)
-curl http://<GATEWAY_HOST>:8000/metrics
+### Course correction mid-travel
+```
+course.cancel  →  course.set_destination  →  course.engage
 ```
 
-Check `/health` before entering a request loop. If status is `degraded`, some workers are down — requests will still route to healthy workers but capacity is reduced.
+### Combat engagement
+```
+combat.set_target  →  combat.power_distribution  →  combat.fire_weapon
+```
+Target acquisition alone does not fire. Power must be allocated first.
+
+### Station operations
+```
+navigate.dock  →  station.refuel / station.repair  →  navigate.undock
+```
+
+### Warp travel
+```
+warp.set_factor  →  course.set_destination  →  course.engage
+```
+Set warp factor before destination for hyperspace jumps.
 
 ---
 
-## Error Handling
+## Behavioral Anti-Patterns
 
-| Status | Meaning | Action |
-|--------|---------|--------|
-| 200 | Success | Process response |
-| 503 | No healthy workers / unknown model | Retry after delay, check `/health` |
-| 502 | Worker unreachable after failover | Back off, alert ops |
-| 422 | Malformed request | Fix request body |
+Observed in audit 2026-02-17. Avoid these patterns.
 
-Implement exponential backoff on 502/503. The gateway already does one failover attempt internally — if you get an error, all workers in that pool are likely down.
+### Stuck destination loop
+**Symptom:** `course.set_destination` fires 5+ consecutive ticks with no movement.
+**Cause:** Agent sets a destination but never calls `course.engage`.
+**Fix:** Always emit `course.engage` in the tick immediately following `course.set_destination`.
+
+If your agent implementation supports it, add a stuck-detection rule:
+> If the same intent has fired 3+ consecutive ticks without a state change, escalate to a reassessment decision — ignore prior intent and re-evaluate from current state.
+
+### Boilerplate chat responses
+**Symptom:** Identical chat replies sent to multiple different players or situations.
+**Cause:** Agent treats chat as a template fill rather than a contextual response.
+**Fix:** Include the player's name, their message content, and the current situation in the response. Vary acknowledgments. Never cache or reuse a prior reply verbatim.
+
+### Over-routing to `heavy`
+**Symptom:** Long LLM latency on routine navigation ticks; `heavy` usage for non-dialogue decisions.
+**Fix:** Route by decision type — see Performance section above. Navigation agents should use `light` by default.
+
+### Ignoring available actions
+**Symptom:** Agent never uses `combat.fire_weapon`, `navigate.jump`, `warp.set_factor`, etc. despite game state warranting them.
+**Cause:** System prompt doesn't motivate these behaviors, or action definitions lack enough context.
+**Fix:** Ensure system prompt describes *when* to use each action class. Include explicit behavioral triggers (e.g., "if under attack and health < 50%, consider retreat via `navigate.jump`").
 
 ---
 
-## Context Window
+## Rollout Checklist
 
-Both models are configured with an **8192 token context window**. Budget your system prompt + conversation history + max_tokens to stay within this limit. If you exceed it, the request will fail.
+Before deploying a new NPC agent:
 
-Rough token math: ~4 characters per token for English text.
-
----
-
-## Performance Expectations
-
-- **Light model**: ~50-150ms time-to-first-token, suitable for real-time NPC interaction
-- **Heavy model**: ~100-300ms time-to-first-token, use for background/async reasoning
-- The gateway round-robins across 2 replicas per model — concurrent requests distribute automatically
-- Under burst load, requests queue inside vLLM's continuous batcher — latency increases but requests don't drop
+- [ ] System prompt tested under 3K tokens
+- [ ] Model tier selected (`heavy` vs `light`) with justification — navigation agents default to `light`
+- [ ] History management strategy defined (window size or summarization trigger)
+- [ ] Tool definitions validated against API contract
+- [ ] Max output tokens set explicitly (don't rely on model defaults)
+- [ ] Behavior tested at edge: unknown questions, off-topic inputs, repeated queries
+- [ ] Action sequences validated: multi-step actions (destination→engage, dock→repair→undock) tested end-to-end
+- [ ] Stuck detection accounted for: agent has a rule to break out of repeated identical intents
+- [ ] P50 latency measured under expected load and within target for chosen model tier

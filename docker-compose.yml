@@ -25,7 +25,7 @@ services:
       - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
       - --enable-auto-tool-choice
       - --dtype=half
-      - --quantization=awq
+      - --quantization=awq_marlin
     volumes:
       - ${MODEL_REPO}:/models:ro
     ports:
@@ -60,7 +60,7 @@ services:
       - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
       - --enable-auto-tool-choice
       - --dtype=half
-      - --quantization=awq
+      - --quantization=awq_marlin
 
     volumes:
       - ${MODEL_REPO}:/models:ro
@@ -96,7 +96,7 @@ services:
       - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
       - --enable-auto-tool-choice
       - --dtype=half
-      - --quantization=awq
+      - --quantization=awq_marlin
     volumes:
       - ${MODEL_REPO}:/models:ro
     ports:
@@ -131,7 +131,7 @@ services:
       - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
       - --enable-auto-tool-choice
       - --dtype=half
-      - --quantization=awq
+      - --quantization=awq_marlin
 
     volumes:
       - ${MODEL_REPO}:/models:ro
@@ -176,7 +176,7 @@ services:
       light-1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
