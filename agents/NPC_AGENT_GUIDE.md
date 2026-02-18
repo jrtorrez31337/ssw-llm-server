@@ -14,6 +14,83 @@ The SSW AI inference platform is accessible at the gateway host on port `8000` v
 
 ---
 
+## Known Issues — Action Required
+
+Confirmed across multiple agents in audits 2026-02-17 and 2026-02-18. These are implementation bugs in `npc-agent-ts`, not model issues. Both must be fixed.
+
+---
+
+### BUG 1: `course.engage` is never called
+
+`course.set_destination` has been observed repeating 5–22 consecutive ticks across every agent tested. Agents set a destination but never engage it, so the ship never moves.
+
+**Root cause:** The agent loop lets the LLM decide every tick, and the LLM re-decides `set_destination` rather than completing the sequence. `course.engage` must be enforced by the loop, not left to the model.
+
+**Required fix — enforce engage in the tick loop:**
+
+```typescript
+let pendingEngage = false;
+
+async function tick(agentState: AgentState): Promise<Action> {
+  // Intercept: if last tick was set_destination, this tick must be engage
+  if (pendingEngage) {
+    pendingEngage = false;
+    return { intent: 'course.engage' };
+  }
+
+  const action = await llm.decide(agentState);
+
+  if (action.intent === 'course.set_destination') {
+    pendingEngage = true;  // next tick will force engage
+  }
+
+  return action;
+}
+```
+
+Do not rely on the model to call `course.engage` unprompted — it will not. Enforce it in code.
+
+---
+
+### BUG 2: No stuck detection
+
+When an agent becomes stuck (same intent 3+ consecutive ticks), it continues calling the LLM indefinitely with the same context and getting the same answer. This wastes inference capacity and degrades latency for all other agents.
+
+**Required fix — track intent history and break loops:**
+
+```typescript
+const STUCK_THRESHOLD = 3;
+const recentIntents: string[] = [];
+
+async function tick(agentState: AgentState): Promise<Action> {
+  let action = await llm.decide(agentState);
+
+  // Update intent history
+  recentIntents.push(action.intent);
+  if (recentIntents.length > STUCK_THRESHOLD) recentIntents.shift();
+
+  // Detect stuck: same intent repeated STUCK_THRESHOLD times
+  const isStuck =
+    recentIntents.length === STUCK_THRESHOLD &&
+    recentIntents.every(i => i === recentIntents[0]);
+
+  if (isStuck) {
+    recentIntents.length = 0;
+    // Re-decide with explicit reassessment instruction injected into context
+    action = await llm.decide({
+      ...agentState,
+      systemOverride: 'You have been repeating the same action. Stop. Reassess your situation and choose a different action.',
+    });
+  }
+
+  return action;
+}
+```
+
+Reset `recentIntents` on any successful state change (e.g., sector transition, new event received).
+
+---
+
 ## Token Budget
 
 64K is shared between everything in the request. Design for the common case — most NPC interactions should target **under 8K total** to preserve throughput.
@@ -94,26 +171,39 @@ You do not know: [explicit gaps — prevents hallucination]
 
 Don't accumulate raw history indefinitely. KV cache pressure slows inference for all concurrent users.
 
-**Recommended approach: summarize-and-compress**
+Observed: `test-agent-01` accumulated 760 memory entries with 0 compaction events. Memory growing unbounded will bloat prompts and increase latency for all agents.
 
-Trigger when history exceeds ~8K tokens:
+**Compaction triggers — fire on EITHER condition:**
 
-```python
-summary = client.chat.completions.create(
-    model="light",
-    messages=[
-        {
-            "role": "system",
-            "content": "Summarize this NPC conversation into key facts, relationship state, and unresolved threads. Max 300 tokens."
-        },
-        {
-            "role": "user",
-            "content": full_history_text
-        }
+```typescript
+const MEMORY_COUNT_THRESHOLD = 100;   // entries
+const MEMORY_TOKEN_THRESHOLD = 6_000; // estimated prompt tokens
+
+function shouldCompact(memoryEntries: MemoryEntry[], estimatedTokens: number): boolean {
+  return memoryEntries.length >= MEMORY_COUNT_THRESHOLD ||
+         estimatedTokens >= MEMORY_TOKEN_THRESHOLD;
+}
+```
+
+**Summarize-and-compress:**
+
+```typescript
+if (shouldCompact(memory, estimatedTokens)) {
+  const summary = await llm.complete({
+    model: 'light',
+    messages: [
+      {
+        role: 'system',
+        content: 'Summarize this NPC memory into key facts, entity relationships, and unresolved threads. Max 300 tokens. Be dense.',
+      },
+      { role: 'user', content: serializeMemory(memory) },
     ],
-    max_tokens=300
-)
-# Replace history with: [{"role": "assistant", "content": f"[Prior context]: {summary}"}]
+    max_tokens: 300,
+  });
+
+  // Replace full memory with single compressed entry
+  memory = [{ role: 'assistant', content: `[Compressed memory]: ${summary}` }];
+}
 ```
 
 For persistent NPCs, store structured state (relationship score, known facts, quest flags) in your world DB — not in the conversation history.
@@ -294,15 +384,12 @@ Set warp factor before destination for hyperspace jumps.
 
 ## Behavioral Anti-Patterns
 
-Observed in audit 2026-02-17. Avoid these patterns.
+Observed in audits 2026-02-17 and 2026-02-18. Confirmed across multiple agents.
 
 ### Stuck destination loop
 **Symptom:** `course.set_destination` fires 5+ consecutive ticks with no movement.
 **Cause:** Agent sets a destination but never calls `course.engage`.
-**Fix:** Always emit `course.engage` in the tick immediately following `course.set_destination`.
-
-If your agent implementation supports it, add a stuck-detection rule:
-> If the same intent has fired 3+ consecutive ticks without a state change, escalate to a reassessment decision — ignore prior intent and re-evaluate from current state.
+**Fix:** See **BUG 1** and **BUG 2** at the top of this document — both fixes are required.
 
 ### Boilerplate chat responses
 **Symptom:** Identical chat replies sent to multiple different players or situations.
