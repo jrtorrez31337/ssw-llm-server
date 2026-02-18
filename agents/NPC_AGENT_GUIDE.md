@@ -97,6 +97,72 @@ async function tick(agentState: AgentState): Promise<Action> {
 
 Reset `recentIntents` on any successful state change (e.g., sector transition, new event received).
 
+**This applies to all intents, not just `course.set_destination`.** Observed in audit 2026-02-18: `scan.active` stuck in 26 separate runs of 5+ consecutive ticks. The sliding window must wrap the entire decision loop, not be applied selectively per intent. A dedicated stuck handler per intent will miss cases — use a single generic check on the returned intent string.
+
+---
+
+### BUG 3: Model returning non-JSON / empty intent
+
+Observed in audit 2026-02-18: 2x `Failed to parse LLM response: no valid JSON found`, 2x empty intent string `""` blocked by the safety gate.
+
+**Why this happens:** Two likely triggers:
+- **Memory compaction summaries injecting unusual context.** The compaction output is fed back as an assistant message. If the summary contains structured text that looks like a partial response, the model may continue it rather than starting a fresh JSON action.
+- **System override messages.** The stuck-detection override (`"You have been repeating the same action..."`) is a user-role injection mid-loop. Some models respond to this with acknowledgment prose (`"Understood, reassessing..."`) rather than a JSON action.
+
+**Required fixes:**
+
+1. **Set a minimum `max_tokens`.** If `max_tokens` is too low, the model truncates mid-JSON. Minimum 256 for any decision tick.
+
+2. **Re-prompt once on parse failure before erroring.** Do not propagate a parse failure directly — retry with an explicit JSON reminder:
+
+```typescript
+async function decide(agentState: AgentState): Promise<Action> {
+  let raw = await llm.complete(agentState);
+
+  if (!isValidJSON(raw)) {
+    // Single retry with explicit format reminder
+    raw = await llm.complete({
+      ...agentState,
+      systemOverride: 'Your previous response was not valid JSON. Respond only with a valid JSON action object. No prose.',
+    });
+  }
+
+  if (!isValidJSON(raw)) {
+    // Log raw output for diagnostics, then fall back to a safe default
+    logger.error('LLM parse failure after retry', { raw });
+    return { intent: 'hold' };  // safe no-op
+  }
+
+  return JSON.parse(raw);
+}
+```
+
+3. **Log raw model output on failure.** The parse error alone is not enough to diagnose — you need the raw string. Add structured logging of the raw response whenever a parse failure occurs.
+
+4. **Sanitize compaction output before injecting.** Strip any text that looks like a partial JSON action from the compaction summary before feeding it back into context.
+
+---
+
+### BUG 4: `scan.active` target_id must be a UUID
+
+Observed in audit 2026-02-18: `Safety: scan.active target_id must be a UUID when provided` — safety gate blocked 1 action.
+
+**Why this happens:** The model generates a `target_id` value by hallucinating an entity identifier (e.g., a ship name, a coordinate string, or a partial ID) rather than using a real UUID from the world state. It has no way to know valid UUIDs unless they appear in its context.
+
+**Required fixes:**
+
+1. **Only pass `target_id` when you have a real UUID from world state.** If no valid target entity is in context, omit the field entirely — `scan.active` without a `target_id` is a valid area scan.
+
+2. **Enumerate valid target UUIDs in the actionable state.** If you want the model to scan specific entities, include their UUIDs explicitly in the context so the model can reference them:
+
+```
+NEARBY ENTITIES
+- id: "fdcf66d3-b49e-48a4-8c80-d38e7749a1c9"  type: ship  name: To'vah
+- id: "a3e2c1d4-..."                           type: station  name: Port Veluna
+```
+
+3. **Validate UUID format before execution.** The safety gate catches this, but the action is wasted. Add client-side validation: if `target_id` is present and not a valid UUID v4, strip it before submitting.
+
 ---
 
 ## Token Budget
@@ -422,6 +488,14 @@ Observed in audits 2026-02-17 and 2026-02-18. Confirmed across multiple agents.
 **Cause:** System prompt doesn't motivate these behaviors, or action definitions lack enough context.
 **Fix:** Ensure system prompt describes *when* to use each action class. Include explicit behavioral triggers (e.g., "if under attack and health < 50%, consider retreat via `navigate.jump`").
 
+### Model returning non-JSON or empty intent
+**Symptom:** `Failed to parse LLM response`, empty intent `""` blocked by safety gate.
+**Fix:** See **BUG 3** at the top of this document.
+
+### Hallucinated `target_id` on `scan.active`
+**Symptom:** `Safety: scan.active target_id must be a UUID when provided`.
+**Fix:** See **BUG 4** at the top of this document.
+
 ---
 
 ## Rollout Checklist
@@ -435,5 +509,8 @@ Before deploying a new NPC agent:
 - [ ] Max output tokens set explicitly (don't rely on model defaults)
 - [ ] Behavior tested at edge: unknown questions, off-topic inputs, repeated queries
 - [ ] Action sequences validated: multi-step actions (destination→engage, dock→repair→undock) tested end-to-end
-- [ ] Stuck detection accounted for: agent has a rule to break out of repeated identical intents
+- [ ] Stuck detection covers all intents via a single generic sliding-window check, not per-intent handlers
+- [ ] JSON parse failure handled: retry with format reminder, fallback to `hold`, raw output logged
+- [ ] `scan.active` only passes `target_id` when a valid UUID is available in world state context
+- [ ] `max_tokens` set to minimum 256 on all decision ticks
 - [ ] P50 latency measured under expected load and within target for chosen model tier
