@@ -24,7 +24,7 @@ Confirmed across multiple agents in audits 2026-02-17 and 2026-02-18. These are 
 
 `course.set_destination` has been observed repeating 5–22 consecutive ticks across every agent tested. Agents set a destination but never engage it, so the ship never moves.
 
-**Root cause:** The agent loop lets the LLM decide every tick, and the LLM re-decides `set_destination` rather than completing the sequence. `course.engage` must be enforced by the loop, not left to the model.
+**Why this happens:** The LLM decision is stateless. Each tick it receives a snapshot of the world and picks the most appropriate action from that snapshot alone — it has no memory of what it decided last tick. When the state shows "destination: [X], status: not yet engaged," the model evaluates this as a task to be done and emits `set_destination` again, because from its perspective that is the correct response to an unengaged destination. It cannot infer "I must have set this last tick, therefore I should engage now" — that reasoning requires memory of prior decisions, which is not in its context. Documenting the sequence in the guide or the system prompt does not fix this, because the model has no way to observe that it's been looping. The sequence must be enforced in application state.
 
 **Required fix — enforce engage in the tick loop:**
 
@@ -56,6 +56,12 @@ Do not rely on the model to call `course.engage` unprompted — it will not. Enf
 
 When an agent becomes stuck (same intent 3+ consecutive ticks), it continues calling the LLM indefinitely with the same context and getting the same answer. This wastes inference capacity and degrades latency for all other agents.
 
+**Why this happens:** A stuck agent is sending identical requests — same system prompt, same world state snapshot — and receiving identical responses. The model isn't confused; it's doing exactly what it should given the context. Nothing in the context signals that time has passed or that the same action has already been tried. The fix is not to improve the prompt — it's to detect the loop in application code and inject new information that the model hasn't seen before, breaking the repetition.
+
+**Why threshold of 3:** At current P50 latency (~50s), threshold 3 catches a loop within ~2.5 minutes. Lower would produce false positives on legitimately repeated actions (e.g., `scan.active` while surveying a sector). Higher allows more wasted inference calls before intervention.
+
+**Why this degrades other agents:** At P50 ~50s, a single stuck agent fires roughly 1.2 requests/minute. The gateway has 2 workers per model tier. One stuck agent on `light` represents ~60% of one worker's capacity — directly queuing other agents behind it. The more stuck agents, the worse the tail latency for everyone.
+
 **Required fix — track intent history and break loops:**
 
 ```typescript
@@ -76,7 +82,9 @@ async function tick(agentState: AgentState): Promise<Action> {
 
   if (isStuck) {
     recentIntents.length = 0;
-    // Re-decide with explicit reassessment instruction injected into context
+    // Re-decide with explicit reassessment instruction injected into context.
+    // The override works because it adds information the model hasn't seen —
+    // "you've been repeating yourself" — which is sufficient to break the loop.
     action = await llm.decide({
       ...agentState,
       systemOverride: 'You have been repeating the same action. Stop. Reassess your situation and choose a different action.',
@@ -111,6 +119,8 @@ Reserve the large budget for NPCs that carry long quest arcs or persistent relat
 
 Use explicit labeled sections. Bullet lists over paragraphs. Dense prose wastes tokens and degrades instruction following.
 
+**Why structure matters:** LLMs attend to text in proportion to its salience and position. A constraint buried in a paragraph is weighted less than the same constraint as a standalone bullet point. Labeled sections (`BEHAVIORAL RULES`, `KNOWLEDGE LIMITS`) also give the model clear retrieval anchors — it can locate and apply the relevant section when generating a response, rather than trying to extract rules from narrative prose. Fewer tokens for the same instruction density means faster inference and more room for world context.
+
 ```
 IDENTITY
 You are [NPC_NAME], [role in one sentence]. [Personality in one sentence.]
@@ -143,6 +153,8 @@ You do not know: [explicit gaps — prevents hallucination]
 
 ## Model Selection
 
+**Why it matters:** The heavy model (14B parameters) processes and generates tokens at approximately half the speed of the light model (8B) on the same hardware. For structured decisions — navigation, scanning, routine actions — the output is constrained to a JSON schema. Model size affects prose quality and reasoning depth, not JSON accuracy. Routing navigation decisions to `heavy` doubles latency for no observable quality difference, and fills heavy worker queues while light workers sit idle.
+
 ### Use `heavy` when:
 - NPC carries quest-critical information where accuracy matters
 - Multi-step reasoning is required (evaluating player actions, generating consequences)
@@ -154,6 +166,7 @@ You do not know: [explicit gaps — prevents hallucination]
 - High concurrency (merchants, guards, crowd NPCs)
 - Player is spam-pinging the same NPC
 - Latency matters more than depth
+- Any structured action output (navigation, scanning, combat targeting)
 
 ### Request format:
 ```json
@@ -172,6 +185,8 @@ You do not know: [explicit gaps — prevents hallucination]
 Don't accumulate raw history indefinitely. KV cache pressure slows inference for all concurrent users.
 
 Observed: `test-agent-01` accumulated 760 memory entries with 0 compaction events. Memory growing unbounded will bloat prompts and increase latency for all agents.
+
+**Why these specific thresholds:** The 6,000-token threshold comes from observed data — median prompt token usage in audits was 5,242–6,175 tokens. This is the point at which prompt size starts meaningfully affecting KV cache utilization and slowing inference. The 100-entry count threshold is a safety net for cases where individual entries are small; at ~60 bytes average per entry from audit data, 100 entries approximates the same 6K-token target. Both protect the same thing from two different angles — use whichever fires first.
 
 **Compaction triggers — fire on EITHER condition:**
 
@@ -351,6 +366,8 @@ Routing navigation to `heavy` when `light` suffices doubles your latency for no 
 ## Action Sequences & Lifecycles
 
 Actions are not self-completing — many require a follow-up action in the next tick to take effect. Failing to complete a sequence causes stuck behavior.
+
+**Why the model won't complete sequences on its own:** Each tick the model sees the current state and picks the best action for that state. It does not see its prior decisions. A two-step sequence like `set_destination → engage` requires the model to remember step one was already done — but it can't, because last tick's output is not fed back as input. The only reliable approach is to track sequence state in the loop and enforce follow-up actions in code (see BUG 1 fix above). The same principle applies to combat, docking, and warp sequences below.
 
 ### Navigation (travel to a destination)
 ```
