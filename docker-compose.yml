@@ -48,7 +48,7 @@ services:
       start_period: 120s
     restart: unless-stopped
 
-  # === GPU 0: Light worker (Qwen3-8B-AWQ) ===
+  # === GPU 0: Light worker (Qwen3-4B-AWQ) ===
   light-0:
     image: vllm/vllm-openai:latest
     command:
@@ -119,7 +119,7 @@ services:
       start_period: 120s
     restart: unless-stopped
 
-  # === GPU 1: Light worker (Qwen3-8B-AWQ) ===
+  # === GPU 1: Light worker (Qwen3-4B-AWQ) ===
   light-1:
     image: vllm/vllm-openai:latest
     command:
@@ -160,10 +160,16 @@ services:
     build: ./gateway
     ports:
       - "0.0.0.0:${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+      - ./gateway/models.yaml:/app/models.yaml:ro
     environment:
       - GATEWAY_HEAVY_WORKERS=http://heavy-0:8000,http://heavy-1:8000
       - GATEWAY_LIGHT_WORKERS=http://light-0:8000,http://light-1:8000
       - GATEWAY_REDIS_URL=redis://redis:6379/0
+      - GATEWAY_MODELS_DIR=/models
+      - GATEWAY_MODELS_YAML_PATH=/app/models.yaml
+      - GATEWAY_LOADER_URL=http://loader:8001
     depends_on:
       redis:
         condition: service_healthy
@@ -181,6 +187,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+
+  # === Model Loader ===
+  loader:
+    build: ./loader
+    ports:
+      - "127.0.0.1:${LOADER_PORT:-8001}:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MODEL_REPO}:/models:ro
+      - ./gateway/models.yaml:/app/models.yaml:ro
+    environment:
+      - LOADER_GATEWAY_URL=http://gateway:8000
+      - LOADER_MODELS_DIR=/models
+      - LOADER_MODELS_YAML_PATH=/app/models.yaml
+      - LOADER_DOCKER_NETWORK=sswai_default
+      - LOADER_VLLM_IMAGE=vllm/vllm-openai:latest
+      - LOADER_PORT_START=9000
+      - LOADER_PORT_END=9099
+      - LOADER_NUM_GPUS=2
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,55 @@
+models:
+  # === Production (pinned, aliased) ===
+  - model_id: Qwen/Qwen2.5-14B-Instruct-AWQ
+    vram_mb: 10400
+    kv_reserve_mb: 8000
+    aliases: [heavy]
+    pinned: true
+    max_model_len: 32768
+
+  - model_id: Qwen/Qwen3-4B-AWQ
+    vram_mb: 2800
+    kv_reserve_mb: 4000
+    aliases: [light]
+    pinned: true
+    max_model_len: 32768
+
+  # === Available models ===
+  - model_id: Qwen/Qwen3-8B-AWQ
+    vram_mb: 6400
+    kv_reserve_mb: 6000
+    max_model_len: 32768
+
+  - model_id: Qwen/Qwen3-14B-AWQ
+    vram_mb: 10440
+    kv_reserve_mb: 8000
+    max_model_len: 32768
+
+  - model_id: Qwen/Qwen3-4B-Instruct-2507-AWQ
+    vram_mb: 2800
+    kv_reserve_mb: 4000
+    max_model_len: 32768
+
+  - model_id: meta-llama/Llama-3.1-8B-Instruct
+    vram_mb: 16000
+    kv_reserve_mb: 6000
+    dtype: auto
+    max_model_len: 16384
+
+  - model_id: mistralai/Mistral-7B-Instruct-v0.2
+    vram_mb: 14800
+    kv_reserve_mb: 6000
+    dtype: auto
+    max_model_len: 16384
+
+  - model_id: Orion-zhen/Qwen2.5-7B-Instruct-Uncensored
+    vram_mb: 15200
+    kv_reserve_mb: 6000
+    dtype: auto
+    max_model_len: 16384
+
+  - model_id: thirdeyeai/DeepSeek-R1-Distill-Qwen-14B-uncensored
+    vram_mb: 29600
+    kv_reserve_mb: 8000
+    dtype: auto
+    max_model_len: 16384

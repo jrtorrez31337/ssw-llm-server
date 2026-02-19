@@ -1,32 +1,61 @@
 import asyncio
 import json
+import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import Settings, WorkerPool, build_pools, settings
+from config import PoolManager, Settings, settings
+from request_queue import RequestQueue
+from registry import ModelInfo, load_registry
+
+log = logging.getLogger(__name__)
+
+LOADER_URL = os.environ.get("GATEWAY_LOADER_URL", "http://loader:8001")
 
 # ---------------------------------------------------------------------------
 # Globals (initialized in lifespan)
 # ---------------------------------------------------------------------------
-pools: dict[str, WorkerPool] = {}
+pool_mgr = PoolManager()
+model_registry: dict[str, ModelInfo] = {}
 http_client: httpx.AsyncClient = None  # type: ignore[assignment]
 redis_client: redis.Redis = None  # type: ignore[assignment]
+request_queue: RequestQueue = None  # type: ignore[assignment]
 _health_task: asyncio.Task | None = None
 
 
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+def _register_static_workers():
+    """Register workers from legacy env vars (backward compat)."""
+    for url in settings.heavy_workers.split(","):
+        url = url.strip()
+        if url:
+            pool_mgr.register_worker("heavy", url)
+    for url in settings.light_workers.split(","):
+        url = url.strip()
+        if url:
+            pool_mgr.register_worker("light", url)
+    log.info(
+        "Static workers registered: heavy=%d, light=%d",
+        pool_mgr.get_pool("heavy").worker_count() if pool_mgr.get_pool("heavy") else 0,
+        pool_mgr.get_pool("light").worker_count() if pool_mgr.get_pool("light") else 0,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pools, http_client, redis_client, _health_task
+    global model_registry, http_client, redis_client, request_queue, _health_task
 
-    pools = build_pools()
+    model_registry = load_registry(settings.models_dir, settings.models_yaml_path)
+    _register_static_workers()
+
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(
             settings.worker_timeout, connect=settings.worker_connect_timeout
@@ -34,6 +63,7 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
     )
     redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+    request_queue = RequestQueue(redis_client)
     _health_task = asyncio.create_task(_health_loop())
 
     yield
@@ -49,43 +79,70 @@ app = FastAPI(title="SSW AI Gateway", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 # Health-check background loop
 # ---------------------------------------------------------------------------
-async def _check_worker(pool: WorkerPool, url: str):
+async def _check_worker(pool_name: str, url: str):
+    pool = pool_mgr.get_pool(pool_name)
+    if pool is None:
+        return
     try:
         resp = await http_client.get(f"{url}/health", timeout=5.0)
         if resp.status_code == 200:
-            pool.healthy.add(url)
+            pool.mark_healthy(url)
         else:
-            pool.healthy.discard(url)
+            pool.mark_unhealthy(url)
     except Exception:
-        pool.healthy.discard(url)
+        pool.mark_unhealthy(url)
 
 
 async def _health_loop():
     while True:
         tasks = []
-        for pool in pools.values():
+        for name, pool in pool_mgr.all_pools().items():
             for url in pool.all_urls():
-                tasks.append(_check_worker(pool, url))
-        await asyncio.gather(*tasks, return_exceptions=True)
+                tasks.append(_check_worker(name, url))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.sleep(settings.health_check_interval)
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers
+# Model resolution
 # ---------------------------------------------------------------------------
-def _select_worker(model: str) -> tuple[WorkerPool, str]:
-    """Pick a pool by model name and return the next healthy worker URL."""
-    pool = pools.get(model)
-    if pool is None:
-        raise ValueError(f"Unknown model: {model!r}. Must be 'heavy' or 'light'.")
+def _resolve_model(model: str) -> tuple[str, ModelInfo | None]:
+    """Resolve model name/alias to (pool_name, ModelInfo)."""
+    info = model_registry.get(model)
+    if info is None:
+        return model, None
+
+    # Check pools in priority order: requested name, canonical name, model_id
+    for candidate in (model, info.name, info.model_id):
+        pool = pool_mgr.get_pool(candidate)
+        if pool and pool.worker_count() > 0:
+            return candidate, info
+
+    return info.name, info
+
+
+def _select_worker(model: str) -> tuple[str, str, ModelInfo | None]:
+    """Pick pool by model name and return (pool_name, worker_url, ModelInfo)."""
+    pool_name, info = _resolve_model(model)
+    pool = pool_mgr.get_pool(pool_name)
+
+    if pool is None or pool.worker_count() == 0:
+        if info:
+            raise LookupError(
+                f"Model {model!r} is available but not loaded. "
+                f"Use the loader API to start it."
+            )
+        raise ValueError(f"Unknown model: {model!r}")
+
     url = pool.next()
     if url is None:
-        raise RuntimeError(f"No healthy workers in pool {model!r}")
-    return pool, url
+        raise RuntimeError(f"No healthy workers for model {model!r}")
+
+    return pool_name, url, info
 
 
 async def _log_metric(model: str, latency_ms: float, status: int, tokens: int | None):
-    """Push request metric to Redis list (best-effort, fire-and-forget)."""
     try:
         entry = json.dumps({
             "ts": time.time(),
@@ -99,7 +156,115 @@ async def _log_metric(model: str, latency_ms: float, status: int, tokens: int | 
         pipe.ltrim("ssw:metrics", 0, settings.metrics_max_entries - 1)
         await pipe.execute()
     except Exception:
-        pass  # metrics are best-effort
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Auto-load + queue
+# ---------------------------------------------------------------------------
+async def _trigger_loader(model: str):
+    """Ask the loader to start a model (fire-and-forget)."""
+    try:
+        resp = await http_client.post(
+            f"{LOADER_URL}/load",
+            json={"model_name": model},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            log.info("Loader accepted load request for %s", model)
+        else:
+            log.warning("Loader rejected load for %s: %s", model, resp.text)
+    except Exception as e:
+        log.warning("Failed to reach loader for %s: %s", model, e)
+
+
+async def _handle_unloaded_model(model: str, body: dict, request: Request):
+    """Handle a request for an unloaded model: trigger loader, optionally queue."""
+    wait_header = request.headers.get("x-ssw-wait", "").lower()
+    want_wait = wait_header in ("true", "1", "yes")
+
+    # Trigger the loader in the background
+    asyncio.create_task(_trigger_loader(model))
+
+    if not want_wait:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "loading",
+                "model": model,
+                "message": f"Model {model!r} is being loaded. Retry shortly.",
+            },
+            headers={"Retry-After": "60"},
+        )
+
+    # Client wants to wait — subscribe BEFORE enqueuing to avoid pub/sub race (C3)
+    request_id, response = await request_queue.enqueue_and_wait(model, body, timeout=180)
+
+    if response is None:
+        return JSONResponse(
+            status_code=504,
+            content={"error": f"Timed out waiting for model {model!r} to load"},
+        )
+
+    return JSONResponse(
+        status_code=response.get("status_code", 200),
+        content=response.get("body", {}),
+    )
+
+
+async def _drain_and_execute(model: str):
+    """Drain queued requests for a model and execute them."""
+    entries = await request_queue.drain_queue(model)
+    for entry in entries:
+        asyncio.create_task(_execute_queued_request(entry))
+
+
+async def _execute_queued_request(entry: dict):
+    """Execute a single queued request and publish the response."""
+    request_id = entry["request_id"]
+    model = entry["model"]
+    body = entry["body"]
+
+    # Skip stale entries (I4)
+    age = time.time() - entry.get("ts", 0)
+    if age > 180:
+        log.info("Skipping stale queued request %s (age=%.0fs)", request_id, age)
+        await request_queue.publish_response(request_id, {
+            "status_code": 504,
+            "body": {"error": "Request expired while waiting for model to load"},
+        })
+        return
+
+    try:
+        pool_name, worker_url, model_info = _select_worker(model)
+    except Exception as e:
+        await request_queue.publish_response(request_id, {
+            "status_code": 503,
+            "body": {"error": str(e)},
+        })
+        return
+
+    if model_info and model_info.thinking_suppression:
+        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+
+    target = f"{worker_url}/v1/chat/completions"
+    body["stream"] = False
+
+    try:
+        resp = await http_client.post(target, json=body)
+        try:
+            resp_body = resp.json()
+        except Exception:
+            resp_body = {"error": resp.text[:500]}
+        await request_queue.publish_response(request_id, {
+            "status_code": resp.status_code,
+            "body": resp_body,
+        })
+    except Exception as e:
+        await request_queue.publish_response(request_id, {
+            "status_code": 502,
+            "body": {"error": f"Worker failed: {e}"},
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -108,10 +273,12 @@ async def _log_metric(model: str, latency_ms: float, status: int, tokens: int | 
 @app.get("/health")
 async def health():
     worker_status = {}
-    for name, pool in pools.items():
-        for url in pool.all_urls():
-            worker_status[url] = "healthy" if url in pool.healthy else "unhealthy"
-    all_healthy = all(v == "healthy" for v in worker_status.values())
+    for name, pool in pool_mgr.all_pools().items():
+        for url, healthy in pool.health_snapshot().items():
+            worker_status[url] = "healthy" if healthy else "unhealthy"
+    all_healthy = len(worker_status) > 0 and all(
+        v == "healthy" for v in worker_status.values()
+    )
     return JSONResponse(
         status_code=200 if all_healthy else 503,
         content={"status": "ok" if all_healthy else "degraded", "workers": worker_status},
@@ -120,13 +287,37 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "heavy", "object": "model", "owned_by": "ssw"},
-            {"id": "light", "object": "model", "owned_by": "ssw"},
-        ],
-    }
+    loaded_pools = pool_mgr.all_pools()
+    seen = set()
+    data = []
+
+    for name, info in model_registry.items():
+        if info.model_id in seen:
+            continue
+        seen.add(info.model_id)
+
+        status = "available"
+        workers = 0
+        for check_name in [info.name, info.model_id] + info.aliases:
+            pool = loaded_pools.get(check_name)
+            if pool and pool.worker_count() > 0:
+                status = "loaded"
+                workers += pool.worker_count()
+
+        data.append({
+            "id": info.name,
+            "model_id": info.model_id,
+            "object": "model",
+            "owned_by": "ssw",
+            "status": status,
+            "workers": workers,
+            "vram_mb": info.vram_mb,
+            "aliases": info.aliases,
+            "architecture": info.architecture,
+            "quant_method": info.quant_method,
+        })
+
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
@@ -135,16 +326,19 @@ async def chat_completions(request: Request):
     model = body.get("model", "heavy")
     is_stream = body.get("stream", False)
 
-    # Inject thinking suppression for light model
-    if model == "light":
-        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-
-    # Select worker
+    # Select worker — with queue support for unloaded models
     try:
-        pool, worker_url = _select_worker(model)
+        pool_name, worker_url, model_info = _select_worker(model)
+    except LookupError:
+        return await _handle_unloaded_model(model, body, request)
     except (ValueError, RuntimeError) as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
 
+    # Thinking suppression based on registry
+    if model_info and model_info.thinking_suppression:
+        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+
+    pool = pool_mgr.get_pool(pool_name)
     target = f"{worker_url}/v1/chat/completions"
     t0 = time.monotonic()
 
@@ -154,8 +348,7 @@ async def chat_completions(request: Request):
             worker_req = http_client.build_request("POST", target, json=body)
             worker_resp = await http_client.send(worker_req, stream=True)
         except Exception as exc:
-            # Try failover to another healthy worker
-            fallback_url = pool.next()
+            fallback_url = pool.next() if pool else None
             if fallback_url and fallback_url != worker_url:
                 try:
                     worker_req = http_client.build_request(
@@ -163,9 +356,13 @@ async def chat_completions(request: Request):
                     )
                     worker_resp = await http_client.send(worker_req, stream=True)
                 except Exception:
-                    return JSONResponse(status_code=502, content={"error": f"All workers failed: {exc}"})
+                    return JSONResponse(
+                        status_code=502, content={"error": f"All workers failed: {exc}"}
+                    )
             else:
-                return JSONResponse(status_code=502, content={"error": f"Worker unreachable: {exc}"})
+                return JSONResponse(
+                    status_code=502, content={"error": f"Worker unreachable: {exc}"}
+                )
 
         async def stream_generator():
             try:
@@ -186,26 +383,74 @@ async def chat_completions(request: Request):
     try:
         resp = await http_client.post(target, json=body)
     except Exception as exc:
-        # Failover
-        fallback_url = pool.next()
+        fallback_url = pool.next() if pool else None
         if fallback_url and fallback_url != worker_url:
             try:
                 resp = await http_client.post(
                     f"{fallback_url}/v1/chat/completions", json=body
                 )
             except Exception:
-                return JSONResponse(status_code=502, content={"error": f"All workers failed: {exc}"})
+                return JSONResponse(
+                    status_code=502, content={"error": f"All workers failed: {exc}"}
+                )
         else:
-            return JSONResponse(status_code=502, content={"error": f"Worker unreachable: {exc}"})
+            return JSONResponse(
+                status_code=502, content={"error": f"Worker unreachable: {exc}"}
+            )
 
     latency = (time.monotonic() - t0) * 1000
-    resp_json = resp.json()
+    try:
+        resp_json = resp.json()
+    except Exception:
+        resp_json = {"error": resp.text[:500]}
     tokens = None
     if "usage" in resp_json:
         tokens = resp_json["usage"].get("total_tokens")
     await _log_metric(model, latency, resp.status_code, tokens)
 
     return JSONResponse(status_code=resp.status_code, content=resp_json)
+
+
+# ---------------------------------------------------------------------------
+# Internal worker management API (called by loader)
+# ---------------------------------------------------------------------------
+@app.post("/internal/workers/register")
+async def register_worker(request: Request):
+    body = await request.json()
+    model_name = body.get("model_name")
+    url = body.get("url")
+    if not model_name or not url:
+        return JSONResponse(
+            status_code=400, content={"error": "model_name and url required"}
+        )
+    pool = pool_mgr.register_worker(model_name, url)
+    log.info("Worker registered: model=%s url=%s total=%d", model_name, url, pool.worker_count())
+
+    # Drain any queued requests for this model (and aliases)
+    asyncio.create_task(_drain_and_execute(model_name))
+    info = model_registry.get(model_name)
+    if info:
+        for alias in info.aliases:
+            if alias != model_name:
+                asyncio.create_task(_drain_and_execute(alias))
+
+    return {"status": "registered", "model": model_name, "url": url, "workers": pool.worker_count()}
+
+
+@app.post("/internal/workers/unregister")
+async def unregister_workers(request: Request):
+    body = await request.json()
+    model_name = body.get("model_name")
+    url = body.get("url")
+    if not model_name or not url:
+        return JSONResponse(
+            status_code=400, content={"error": "model_name and url required"}
+        )
+    ok = pool_mgr.unregister_worker(model_name, url)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": f"Pool {model_name!r} not found"})
+    log.info("Worker unregistered: model=%s url=%s", model_name, url)
+    return {"status": "unregistered", "model": model_name, "url": url}
 
 
 @app.get("/metrics")
@@ -217,7 +462,6 @@ async def metrics():
 
     entries = [json.loads(r) for r in raw]
 
-    # Aggregate by model
     stats: dict[str, dict] = {}
     for e in entries:
         m = e["model"]
@@ -239,10 +483,9 @@ async def metrics():
             "total_tokens": s["total_tokens"],
         }
 
-    # Active requests per worker (based on health status)
     workers = {}
-    for name, pool in pools.items():
-        for url in pool.all_urls():
-            workers[url] = "healthy" if url in pool.healthy else "unhealthy"
+    for name, pool in pool_mgr.all_pools().items():
+        for url, healthy in pool.health_snapshot().items():
+            workers[url] = "healthy" if healthy else "unhealthy"
 
     return {"models": summary, "workers": workers, "recent_entries": len(entries)}
