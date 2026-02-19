@@ -8,3 +8,4 @@ __pycache__/
 
 # Secrets / local-only docs
 agents/YAKLOG_GUIDE.md
+audit-report*.md
