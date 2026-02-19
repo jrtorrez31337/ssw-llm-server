@@ -100,6 +100,12 @@ Key Files:
 - gateway/models.yaml — per-model overrides (VRAM, aliases, pinned, max_model_len)
 - loader/loader.py — Docker SDK container lifecycle, GPU placement, LRU eviction
 - scripts/load_test.py — concurrent load testing tool
+- agents/YAKLOG_GUIDE.md — yaklog inter-agent messaging reference (local-only, gitignored)
+
+Inter-Agent Coordination:
+- yaklog (http://192.168.122.76:3100) — shared context channel for Claude/Codex sessions
+- Channel: "handoff" — all cross-session updates, audit results, and operational guidance
+- NPC Agent Integration Guide lives on yaklog (msgs 10-13), not in repo
 
 Implementation Status:
 1. ✅ Foundation — project scaffold, Docker Compose, GPU assignments, Redis
