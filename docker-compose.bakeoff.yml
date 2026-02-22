@@ -1,0 +1,72 @@
+name: sswai-bakeoff
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${BAKEOFF_REDIS_PORT:-6380}:6379"
+    volumes:
+      - bakeoff-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  gateway:
+    build: ./gateway
+    ports:
+      - "0.0.0.0:${BAKEOFF_GATEWAY_PORT:-8100}:8000"
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+      - ${BAKEOFF_MODELS_YAML_PATH:-./gateway/models.bakeoff.yaml}:/app/models.yaml:ro
+    environment:
+      - GATEWAY_HEAVY_WORKERS=
+      - GATEWAY_LIGHT_WORKERS=
+      - GATEWAY_REDIS_URL=redis://redis:6379/0
+      - GATEWAY_MODELS_DIR=/models
+      - GATEWAY_MODELS_YAML_PATH=/app/models.yaml
+      - GATEWAY_LOADER_URL=http://loader:8001
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  loader:
+    build: ./loader
+    ports:
+      - "127.0.0.1:${BAKEOFF_LOADER_PORT:-8111}:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MODEL_REPO}:/models:ro
+      - ${BAKEOFF_MODELS_YAML_PATH:-./gateway/models.bakeoff.yaml}:/app/models.yaml:ro
+    environment:
+      - LOADER_GATEWAY_URL=http://gateway:8000
+      - LOADER_MODELS_DIR=/models
+      - LOADER_MODELS_YAML_PATH=/app/models.yaml
+      - LOADER_DOCKER_NETWORK=sswai-bakeoff_default
+      - LOADER_VLLM_IMAGE=vllm/vllm-openai:latest
+      - LOADER_PORT_START=${BAKEOFF_DYNAMIC_PORT_START:-9100}
+      - LOADER_PORT_END=${BAKEOFF_DYNAMIC_PORT_END:-9199}
+      - LOADER_NUM_GPUS=${BAKEOFF_NUM_GPUS:-2}
+      - LOADER_CONTAINER_PREFIX=ssw-bakeoff
+    depends_on:
+      gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  bakeoff-redis-data:

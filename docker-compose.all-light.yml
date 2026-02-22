@@ -1,0 +1,181 @@
+# SSW AI Inference — All-Light Configuration
+# 10× Qwen3-4B-AWQ workers (5 per GPU), maximum throughput
+#
+# Usage:
+#   docker compose -f docker-compose.all-light.yml --env-file .env.all-light up -d
+#
+# Rollback to mixed config:
+#   docker compose -f docker-compose.all-light.yml down
+#   docker compose up -d
+
+x-light-worker: &light-worker
+  image: vllm/vllm-openai:latest
+  command:
+    - --model=/models/${LIGHT_MODEL}
+    - --served-model-name=light
+    - --port=8000
+    - --gpu-memory-utilization=${LIGHT_GPU_MEMORY_UTILIZATION}
+    - --max-model-len=${VLLM_MAX_MODEL_LEN}
+    - --tool-call-parser=${VLLM_TOOL_CALL_PARSER}
+    - --enable-auto-tool-choice
+    - --dtype=half
+    - --quantization=awq_marlin
+  volumes:
+    - ${MODEL_REPO}:/models:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 120s
+  restart: unless-stopped
+
+x-gpu0: &gpu0
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+
+x-gpu1: &gpu1
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["1"]
+            capabilities: [gpu]
+
+services:
+  # === Redis ===
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # === GPU 0: light-0 through light-4 ===
+  light-0:
+    <<: [*light-worker, *gpu0]
+    ports:
+      - "127.0.0.1:${LIGHT_0_PORT}:8000"
+
+  light-1:
+    <<: [*light-worker, *gpu0]
+    ports:
+      - "127.0.0.1:${LIGHT_1_PORT}:8000"
+
+  light-2:
+    <<: [*light-worker, *gpu0]
+    ports:
+      - "127.0.0.1:${LIGHT_2_PORT}:8000"
+
+  light-3:
+    <<: [*light-worker, *gpu0]
+    ports:
+      - "127.0.0.1:${LIGHT_3_PORT}:8000"
+
+  light-4:
+    <<: [*light-worker, *gpu0]
+    ports:
+      - "127.0.0.1:${LIGHT_4_PORT}:8000"
+
+  # === GPU 1: light-5 through light-9 ===
+  light-5:
+    <<: [*light-worker, *gpu1]
+    ports:
+      - "127.0.0.1:${LIGHT_5_PORT}:8000"
+
+  light-6:
+    <<: [*light-worker, *gpu1]
+    ports:
+      - "127.0.0.1:${LIGHT_6_PORT}:8000"
+
+  light-7:
+    <<: [*light-worker, *gpu1]
+    ports:
+      - "127.0.0.1:${LIGHT_7_PORT}:8000"
+
+  light-8:
+    <<: [*light-worker, *gpu1]
+    ports:
+      - "127.0.0.1:${LIGHT_8_PORT}:8000"
+
+  light-9:
+    <<: [*light-worker, *gpu1]
+    ports:
+      - "127.0.0.1:${LIGHT_9_PORT}:8000"
+
+  # === API Gateway ===
+  gateway:
+    build: ./gateway
+    ports:
+      - "0.0.0.0:${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      - ${MODEL_REPO}:/models:ro
+      - ./gateway/models.yaml:/app/models.yaml:ro
+    environment:
+      - GATEWAY_HEAVY_WORKERS=
+      - GATEWAY_LIGHT_WORKERS=http://light-0:8000,http://light-1:8000,http://light-2:8000,http://light-3:8000,http://light-4:8000,http://light-5:8000,http://light-6:8000,http://light-7:8000,http://light-8:8000,http://light-9:8000
+      - GATEWAY_REDIS_URL=redis://redis:6379/0
+      - GATEWAY_MODELS_DIR=/models
+      - GATEWAY_MODELS_YAML_PATH=/app/models.yaml
+      - GATEWAY_LOADER_URL=http://loader:8001
+    depends_on:
+      redis:
+        condition: service_healthy
+      light-0:
+        condition: service_healthy
+      light-5:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # === Model Loader ===
+  loader:
+    build: ./loader
+    ports:
+      - "127.0.0.1:${LOADER_PORT:-8011}:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MODEL_REPO}:/models:ro
+      - ./gateway/models.yaml:/app/models.yaml:ro
+    environment:
+      - LOADER_GATEWAY_URL=http://gateway:8000
+      - LOADER_MODELS_DIR=/models
+      - LOADER_MODELS_YAML_PATH=/app/models.yaml
+      - LOADER_DOCKER_NETWORK=sswai_default
+      - LOADER_VLLM_IMAGE=vllm/vllm-openai:latest
+      - LOADER_PORT_START=9000
+      - LOADER_PORT_END=9099
+      - LOADER_NUM_GPUS=2
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  redis-data:

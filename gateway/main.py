@@ -5,6 +5,8 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+_GATEWAY_CREATED = int(time.time())
+
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, Query, Request
@@ -17,6 +19,15 @@ from registry import ModelInfo, load_registry
 log = logging.getLogger(__name__)
 
 LOADER_URL = os.environ.get("GATEWAY_LOADER_URL", "http://loader:8001")
+
+
+def _oai_error(status: int, message: str, error_type: str = "invalid_request_error",
+               code: str | None = None) -> JSONResponse:
+    """Return an OpenAI-compatible error response."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": error_type, "param": None, "code": code}},
+    )
 
 # ---------------------------------------------------------------------------
 # Globals (initialized in lifespan)
@@ -92,6 +103,27 @@ async def _check_worker(pool_name: str, url: str):
     except Exception:
         pool.mark_unhealthy(url)
 
+    # Scrape vLLM queue depth
+    try:
+        resp = await http_client.get(f"{url}/metrics", timeout=5.0)
+        if resp.status_code == 200:
+            depth = _parse_queue_depth(resp.text)
+            pool.set_queue_depth(url, depth)
+    except Exception:
+        pass
+
+
+def _parse_queue_depth(metrics_text: str) -> int:
+    """Extract running + waiting request count from Prometheus metrics."""
+    running = 0
+    waiting = 0
+    for line in metrics_text.splitlines():
+        if line.startswith("vllm:num_requests_running{"):
+            running = int(float(line.rsplit(" ", 1)[1]))
+        elif line.startswith("vllm:num_requests_waiting{"):
+            waiting = int(float(line.rsplit(" ", 1)[1]))
+    return running + waiting
+
 
 async def _health_loop():
     while True:
@@ -113,13 +145,17 @@ def _resolve_model(model: str) -> tuple[str, ModelInfo | None]:
     if info is None:
         return model, None
 
-    # Check pools in priority order: requested name, canonical name, model_id
-    for candidate in (model, info.name, info.model_id):
+    # Check pools in priority order: requested name, canonical name, model_id, aliases
+    for candidate in [model, info.name, info.model_id] + info.aliases:
         pool = pool_mgr.get_pool(candidate)
         if pool and pool.worker_count() > 0:
             return candidate, info
 
     return info.name, info
+
+
+class _Saturated(Exception):
+    """Raised when all workers in a pool exceed max queue depth."""
 
 
 def _select_worker(model: str) -> tuple[str, str, ModelInfo | None]:
@@ -139,7 +175,50 @@ def _select_worker(model: str) -> tuple[str, str, ModelInfo | None]:
     if url is None:
         raise RuntimeError(f"No healthy workers for model {model!r}")
 
+    # Backpressure: reject if every healthy worker exceeds max queue depth
+    if settings.max_queue_depth > 0:
+        least_loaded = pool.min_queue_worker()
+        if least_loaded and pool.queue_depth(least_loaded) >= settings.max_queue_depth:
+            raise _Saturated(
+                f"All workers for model {model!r} are at capacity "
+                f"(queue depth >= {settings.max_queue_depth})"
+            )
+        # Route to least-loaded worker instead of round-robin when under pressure
+        if least_loaded and pool.queue_depth(url) > pool.queue_depth(least_loaded):
+            url = least_loaded
+
     return pool_name, url, info
+
+
+def _worker_body(body: dict, pool_name: str) -> dict:
+    """Return request body normalized for worker-served model names."""
+    worker_body = dict(body)
+    worker_body["model"] = pool_name
+    return worker_body
+
+
+def _set_response_model(resp_body: object, requested_model: str) -> None:
+    """Normalize worker response model field back to caller-facing model name."""
+    if isinstance(resp_body, dict) and "model" in resp_body:
+        resp_body["model"] = requested_model
+
+
+def _normalize_sse_line(line: str, requested_model: str) -> str:
+    """Rewrite model field in SSE data lines when payload is JSON."""
+    if not line.startswith("data:"):
+        return line
+
+    payload = line[len("data:"):].lstrip()
+    if not payload or payload == "[DONE]":
+        return line
+
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return line
+
+    _set_response_model(obj, requested_model)
+    return f"data: {json.dumps(obj, separators=(',', ':'))}"
 
 
 async def _log_metric(model: str, latency_ms: float, status: int, tokens: int | None):
@@ -201,10 +280,8 @@ async def _handle_unloaded_model(model: str, body: dict, request: Request):
     request_id, response = await request_queue.enqueue_and_wait(model, body, timeout=180)
 
     if response is None:
-        return JSONResponse(
-            status_code=504,
-            content={"error": f"Timed out waiting for model {model!r} to load"},
-        )
+        return _oai_error(504, f"Timed out waiting for model {model!r} to load",
+                          error_type="server_error", code="timeout")
 
     return JSONResponse(
         status_code=response.get("status_code", 200),
@@ -231,7 +308,8 @@ async def _execute_queued_request(entry: dict):
         log.info("Skipping stale queued request %s (age=%.0fs)", request_id, age)
         await request_queue.publish_response(request_id, {
             "status_code": 504,
-            "body": {"error": "Request expired while waiting for model to load"},
+            "body": {"error": {"message": "Request expired while waiting for model to load",
+                               "type": "server_error", "param": None, "code": "timeout"}},
         })
         return
 
@@ -240,7 +318,7 @@ async def _execute_queued_request(entry: dict):
     except Exception as e:
         await request_queue.publish_response(request_id, {
             "status_code": 503,
-            "body": {"error": str(e)},
+            "body": {"error": {"message": str(e), "type": "server_error", "param": None, "code": None}},
         })
         return
 
@@ -248,14 +326,16 @@ async def _execute_queued_request(entry: dict):
         body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
 
     target = f"{worker_url}/v1/chat/completions"
-    body["stream"] = False
+    worker_body = _worker_body(body, pool_name)
+    worker_body["stream"] = False
 
     try:
-        resp = await http_client.post(target, json=body)
+        resp = await http_client.post(target, json=worker_body)
         try:
             resp_body = resp.json()
         except Exception:
-            resp_body = {"error": resp.text[:500]}
+            resp_body = {"error": {"message": resp.text[:500], "type": "server_error", "param": None, "code": None}}
+        _set_response_model(resp_body, model)
         await request_queue.publish_response(request_id, {
             "status_code": resp.status_code,
             "body": resp_body,
@@ -263,7 +343,7 @@ async def _execute_queued_request(entry: dict):
     except Exception as e:
         await request_queue.publish_response(request_id, {
             "status_code": 502,
-            "body": {"error": f"Worker failed: {e}"},
+            "body": {"error": {"message": f"Worker failed: {e}", "type": "server_error", "param": None, "code": None}},
         })
 
 
@@ -276,48 +356,89 @@ async def health():
     for name, pool in pool_mgr.all_pools().items():
         for url, healthy in pool.health_snapshot().items():
             worker_status[url] = "healthy" if healthy else "unhealthy"
-    all_healthy = len(worker_status) > 0 and all(
-        v == "healthy" for v in worker_status.values()
-    )
+    healthy_count = sum(1 for v in worker_status.values() if v == "healthy")
+    any_healthy = healthy_count > 0
+    all_healthy = healthy_count == len(worker_status) and healthy_count > 0
+    status = "ok" if all_healthy else "degraded" if any_healthy else "down"
     return JSONResponse(
-        status_code=200 if all_healthy else 503,
-        content={"status": "ok" if all_healthy else "degraded", "workers": worker_status},
+        status_code=200 if any_healthy else 503,
+        content={"status": status, "workers": worker_status},
     )
+
+
+def _build_model_entry(info: ModelInfo, public_id: str | None = None) -> dict:
+    """Build an OpenAI-compatible model object with SSW extensions."""
+    active_pools = pool_mgr.all_pools()
+    workers = 0
+    healthy = 0
+    for check_name in [info.name, info.model_id] + info.aliases:
+        pool = active_pools.get(check_name)
+        if pool and pool.worker_count() > 0:
+            workers += pool.worker_count()
+            healthy += pool.healthy_count()
+
+    entry = {
+        "id": public_id or info.name,
+        "object": "model",
+        "created": _GATEWAY_CREATED,
+        "owned_by": "ssw",
+        # SSW extensions
+        "model_id": info.model_id,
+        "status": "loaded" if workers > 0 else "available",
+        "workers": workers,
+        "healthy_workers": healthy,
+        "pinned": info.pinned,
+        "vram_mb": info.vram_mb,
+        "aliases": info.aliases,
+        "architecture": info.architecture,
+        "quant_method": info.quant_method,
+    }
+    return entry
 
 
 @app.get("/v1/models")
 async def list_models():
-    loaded_pools = pool_mgr.all_pools()
-    seen = set()
+    seen_model_ids = set()
+    emitted_ids: set[str] = set()
     data = []
+    for name, info in model_registry.items():
+        if info.model_id in seen_model_ids:
+            continue
+        seen_model_ids.add(info.model_id)
 
+        for public_id in [info.name] + info.aliases:
+            if public_id in emitted_ids:
+                continue
+            emitted_ids.add(public_id)
+            data.append(_build_model_entry(info, public_id=public_id))
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/status")
+async def models_status():
+    seen = set()
+    loaded = []
+    available = []
     for name, info in model_registry.items():
         if info.model_id in seen:
             continue
         seen.add(info.model_id)
+        entry = _build_model_entry(info)
+        if entry["status"] == "loaded":
+            loaded.append(entry)
+        else:
+            available.append(entry)
+    return {"loaded": loaded, "available": available}
 
-        status = "available"
-        workers = 0
-        for check_name in [info.name, info.model_id] + info.aliases:
-            pool = loaded_pools.get(check_name)
-            if pool and pool.worker_count() > 0:
-                status = "loaded"
-                workers += pool.worker_count()
 
-        data.append({
-            "id": info.name,
-            "model_id": info.model_id,
-            "object": "model",
-            "owned_by": "ssw",
-            "status": status,
-            "workers": workers,
-            "vram_mb": info.vram_mb,
-            "aliases": info.aliases,
-            "architecture": info.architecture,
-            "quant_method": info.quant_method,
-        })
-
-    return {"object": "list", "data": data}
+@app.get("/v1/models/{model_id:path}")
+async def retrieve_model(model_id: str):
+    info = model_registry.get(model_id)
+    if info is None:
+        return _oai_error(404, f"The model '{model_id}' does not exist",
+                          code="model_not_found")
+    public_id = model_id if model_id in info.aliases else info.name
+    return _build_model_entry(info, public_id=public_id)
 
 
 @app.post("/v1/chat/completions")
@@ -331,8 +452,16 @@ async def chat_completions(request: Request):
         pool_name, worker_url, model_info = _select_worker(model)
     except LookupError:
         return await _handle_unloaded_model(model, body, request)
-    except (ValueError, RuntimeError) as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
+    except ValueError as e:
+        return _oai_error(404, str(e), code="model_not_found")
+    except _Saturated as e:
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": str(e), "type": "rate_limit_error", "param": None, "code": "engine_overloaded"}},
+            headers={"Retry-After": str(settings.health_check_interval)},
+        )
+    except RuntimeError as e:
+        return _oai_error(503, str(e), error_type="server_error", code="engine_overloaded")
 
     # Thinking suppression based on registry
     if model_info and model_info.thinking_suppression:
@@ -340,34 +469,31 @@ async def chat_completions(request: Request):
 
     pool = pool_mgr.get_pool(pool_name)
     target = f"{worker_url}/v1/chat/completions"
+    worker_body = _worker_body(body, pool_name)
     t0 = time.monotonic()
 
     # --- Streaming ---
     if is_stream:
         try:
-            worker_req = http_client.build_request("POST", target, json=body)
+            worker_req = http_client.build_request("POST", target, json=worker_body)
             worker_resp = await http_client.send(worker_req, stream=True)
         except Exception as exc:
             fallback_url = pool.next() if pool else None
             if fallback_url and fallback_url != worker_url:
                 try:
                     worker_req = http_client.build_request(
-                        "POST", f"{fallback_url}/v1/chat/completions", json=body
+                        "POST", f"{fallback_url}/v1/chat/completions", json=worker_body
                     )
                     worker_resp = await http_client.send(worker_req, stream=True)
                 except Exception:
-                    return JSONResponse(
-                        status_code=502, content={"error": f"All workers failed: {exc}"}
-                    )
+                    return _oai_error(502, f"All workers failed: {exc}", error_type="server_error")
             else:
-                return JSONResponse(
-                    status_code=502, content={"error": f"Worker unreachable: {exc}"}
-                )
+                return _oai_error(502, f"Worker unreachable: {exc}", error_type="server_error")
 
         async def stream_generator():
             try:
-                async for chunk in worker_resp.aiter_bytes():
-                    yield chunk
+                async for line in worker_resp.aiter_lines():
+                    yield (_normalize_sse_line(line, model) + "\n").encode("utf-8")
             finally:
                 await worker_resp.aclose()
                 latency = (time.monotonic() - t0) * 1000
@@ -381,28 +507,25 @@ async def chat_completions(request: Request):
 
     # --- Non-streaming ---
     try:
-        resp = await http_client.post(target, json=body)
+        resp = await http_client.post(target, json=worker_body)
     except Exception as exc:
         fallback_url = pool.next() if pool else None
         if fallback_url and fallback_url != worker_url:
             try:
                 resp = await http_client.post(
-                    f"{fallback_url}/v1/chat/completions", json=body
+                    f"{fallback_url}/v1/chat/completions", json=worker_body
                 )
             except Exception:
-                return JSONResponse(
-                    status_code=502, content={"error": f"All workers failed: {exc}"}
-                )
+                return _oai_error(502, f"All workers failed: {exc}", error_type="server_error")
         else:
-            return JSONResponse(
-                status_code=502, content={"error": f"Worker unreachable: {exc}"}
-            )
+            return _oai_error(502, f"Worker unreachable: {exc}", error_type="server_error")
 
     latency = (time.monotonic() - t0) * 1000
     try:
         resp_json = resp.json()
     except Exception:
-        resp_json = {"error": resp.text[:500]}
+        resp_json = {"error": {"message": resp.text[:500], "type": "server_error", "param": None, "code": None}}
+    _set_response_model(resp_json, model)
     tokens = None
     if "usage" in resp_json:
         tokens = resp_json["usage"].get("total_tokens")
@@ -420,9 +543,7 @@ async def register_worker(request: Request):
     model_name = body.get("model_name")
     url = body.get("url")
     if not model_name or not url:
-        return JSONResponse(
-            status_code=400, content={"error": "model_name and url required"}
-        )
+        return _oai_error(400, "model_name and url required")
     pool = pool_mgr.register_worker(model_name, url)
     log.info("Worker registered: model=%s url=%s total=%d", model_name, url, pool.worker_count())
 
@@ -443,12 +564,10 @@ async def unregister_workers(request: Request):
     model_name = body.get("model_name")
     url = body.get("url")
     if not model_name or not url:
-        return JSONResponse(
-            status_code=400, content={"error": "model_name and url required"}
-        )
+        return _oai_error(400, "model_name and url required")
     ok = pool_mgr.unregister_worker(model_name, url)
     if not ok:
-        return JSONResponse(status_code=404, content={"error": f"Pool {model_name!r} not found"})
+        return _oai_error(404, f"Pool {model_name!r} not found", code="not_found")
     log.info("Worker unregistered: model=%s url=%s", model_name, url)
     return {"status": "unregistered", "model": model_name, "url": url}
 

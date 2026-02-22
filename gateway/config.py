@@ -15,6 +15,7 @@ class WorkerPool:
         self._urls: list[str] = list(urls) if urls else []
         self._index = 0
         self.healthy: set[str] = set(self._urls)
+        self._queue_depth: dict[str, int] = {}  # url → running + waiting
         self._lock = threading.Lock()
 
     def next(self) -> str | None:
@@ -66,6 +67,27 @@ class WorkerPool:
     def health_snapshot(self) -> dict[str, bool]:
         with self._lock:
             return {url: url in self.healthy for url in self._urls}
+
+    def set_queue_depth(self, url: str, depth: int) -> None:
+        with self._lock:
+            self._queue_depth[url] = depth
+
+    def queue_depth(self, url: str) -> int:
+        with self._lock:
+            return self._queue_depth.get(url, 0)
+
+    def pool_queue_depth(self) -> int:
+        """Total queue depth across all workers in this pool."""
+        with self._lock:
+            return sum(self._queue_depth.get(u, 0) for u in self._urls)
+
+    def min_queue_worker(self) -> str | None:
+        """Return the healthy worker with lowest queue depth."""
+        with self._lock:
+            healthy_urls = [u for u in self._urls if u in self.healthy]
+            if not healthy_urls:
+                return None
+            return min(healthy_urls, key=lambda u: self._queue_depth.get(u, 0))
 
 
 class PoolManager:
@@ -126,6 +148,9 @@ class Settings(BaseSettings):
     worker_timeout: float = 120.0
     worker_connect_timeout: float = 5.0
     health_check_interval: float = 10.0
+
+    # Backpressure — 429 when every worker in a pool exceeds this queue depth
+    max_queue_depth: int = 32
 
     # Metrics
     metrics_max_entries: int = 10000

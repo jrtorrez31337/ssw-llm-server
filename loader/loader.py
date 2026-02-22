@@ -32,6 +32,7 @@ PORT_START = int(os.environ.get("LOADER_PORT_START", "9000"))
 PORT_END = int(os.environ.get("LOADER_PORT_END", "9099"))
 A40_VRAM_MB = 46068  # NVIDIA A40 total VRAM
 NUM_GPUS = int(os.environ.get("LOADER_NUM_GPUS", "2"))
+CONTAINER_PREFIX = os.environ.get("LOADER_CONTAINER_PREFIX", "ssw")
 HEALTH_POLL_INTERVAL = 5
 HEALTH_TIMEOUT = 180
 
@@ -264,7 +265,7 @@ def _get_docker() -> docker.DockerClient:
 
 def _spawn_vllm_container(mc: ModelConfig, gpu_id: int, port: int) -> str:
     client = _get_docker()
-    container_name = f"ssw-{mc.name}-gpu{gpu_id}"
+    container_name = f"{CONTAINER_PREFIX}-{mc.name}-gpu{gpu_id}"
 
     # Compute GPU memory utilization fraction (I5)
     total_model_vram = mc.vram_mb + mc.kv_reserve_mb

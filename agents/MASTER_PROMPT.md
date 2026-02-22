@@ -33,15 +33,18 @@ FastAPI Gateway (:8000)  ─── 0.0.0.0, accepts remote clients
   │                     merges with models.yaml overrides (VRAM, aliases, pinned)
   │
   ├─ _resolve_model() ── alias lookup, pool matching
-  │   ├─ "heavy" → alias → qwen2.5-14b-instruct-awq pool
-  │   ├─ "light" → alias → qwen3-4b-awq pool
+  │   ├─ "heavy" → alias → active heavy-mapped pool
+  │   ├─ "light" → alias → active light-mapped pool
   │   └─ "qwen3-8b-awq" → direct name → pool (if loaded)
   │
-  ├─ If model loaded → round-robin across healthy workers → proxy to vLLM
+  ├─ If model loaded → least-loaded routing across healthy workers → proxy to vLLM
   │
   ├─ If model NOT loaded:
   │   ├─ No X-SSW-Wait header → 202 + Retry-After: 60
   │   └─ X-SSW-Wait: true → trigger loader, enqueue, block up to 180s
+  │
+  ├─ Backpressure → scrapes vLLM /metrics for queue depth
+  │   └─ All workers saturated (running+waiting >= max_queue_depth) → 429 + Retry-After
   │
   ├─ Failover → retry next healthy worker on connection failure
   │
@@ -61,12 +64,14 @@ Loader Service (:8001)  ─── 127.0.0.1 only
 Design Decisions (LOCKED):
 - Serving engine: vLLM
 - Model discovery: auto-scan /data/models, merge with models.yaml overrides
-- Default models: Qwen2.5-14B-Instruct-AWQ (heavy, pinned) + Qwen3-4B-AWQ (light, pinned)
+- Default models: Qwen3-4B-AWQ (light+heavy aliases, pinned) — 14B available on-demand via loader
 - Available models: 9 vLLM-compatible models on disk (5 AWQ, 4 BF16)
-- Routing: registry-driven alias resolution → round-robin across healthy workers per pool
+- Routing: registry-driven alias resolution → least-loaded routing across healthy workers per pool
 - Burst handling: vLLM's continuous batcher absorbs concurrency natively
 - Redis role: metrics storage only (latency, tokens, error tracking) — request queue only for unloaded model waiting
-- API contract: OpenAI-compatible /v1/chat/completions
+- API contract: OpenAI-compatible /v1/chat/completions, /v1/models, /v1/models/{id}, /v1/models/status
+- Error format: OpenAI-standard {"error": {"message", "type", "param", "code"}}
+- Backpressure: 429 + Retry-After when all workers exceed max_queue_depth (default 32)
 - Orchestration: Docker Compose (static workers) + Docker SDK (dynamic workers via loader)
 - Tool calling: auto-configured per model type (hermes for qwen, llama3_json for llama, mistral for mistral)
 - Thinking suppression: auto-applied to qwen3 models via registry (enable_thinking=false)
@@ -76,8 +81,8 @@ Design Decisions (LOCKED):
 - VRAM reservation: atomic reservation during loads to prevent concurrent oversubscription
 
 Available Models (9 vLLM-compatible):
-- Qwen/Qwen2.5-14B-Instruct-AWQ: ~10.4GB VRAM, qwen2, AWQ, hermes parser (PINNED as "heavy")
-- Qwen/Qwen3-4B-AWQ: ~2.8GB VRAM, qwen3, AWQ, hermes parser (PINNED as "light")
+- Qwen/Qwen2.5-14B-Instruct-AWQ: ~10.4GB VRAM, qwen2, AWQ, hermes parser
+- Qwen/Qwen3-4B-AWQ: ~2.8GB VRAM, qwen3, AWQ, hermes parser
 - Qwen/Qwen3-8B-AWQ: ~6.4GB VRAM, qwen3, AWQ
 - Qwen/Qwen3-14B-AWQ: ~10.4GB VRAM, qwen3, AWQ
 - Qwen/Qwen3-4B-Instruct-2507-AWQ: ~2.8GB VRAM, qwen3, AWQ
@@ -86,21 +91,51 @@ Available Models (9 vLLM-compatible):
 - Orion-zhen/Qwen2.5-7B-Instruct-Uncensored: ~15.2GB VRAM, qwen2, BF16
 - thirdeyeai/DeepSeek-R1-Distill-Qwen-14B-uncensored: ~29.6GB VRAM, qwen2, BF16
 
-GPU Allocation:
-- GPU 0: 1x 14B (heavy-0, ~18.4GB w/ KV) + 1x 4B (light-0, ~6.8GB w/ KV) = ~25.2GB, ~20.9GB free
-- GPU 1: same layout, ~20.9GB free per GPU for dynamic models
-- Loader manages remaining VRAM for on-demand model loading
+Alias/pinning are profile-driven from `gateway/models.yaml` (production) or `gateway/models.bakeoff.yaml` (bakeoff).
+
+GPU Allocation — Two Configurations Available:
+
+Config A (mixed, docker-compose.yml + .env):
+- GPU 0: heavy-0 (14B, 0.50) + light-0 (4B, 0.40) = 90% utilization
+- GPU 1: heavy-1 (14B, 0.50) + light-1 (4B, 0.40) = 90% utilization
+- 4 workers total, ~11.5GB/GPU free for loader
+
+Config B (all-light, docker-compose.all-light.yml + .env.all-light):
+- GPU 0: light-0 through light-4 (5× 4B, 0.17 each) = 85% utilization target
+- GPU 1: light-5 through light-9 (5× 4B, 0.17 each) = 85% utilization target
+- 10 workers total, "heavy" alias routes to light pool
+- Per worker: ~2.8GB weights + ~5GB KV cache at 16K context
+- Switch: docker compose -f docker-compose.all-light.yml --env-file .env.all-light up -d
+
+Config C (bakeoff control plane, docker-compose.bakeoff.yml + .env.bakeoff):
+- Separate compose project name: `sswai-bakeoff` (isolated network/ports/redis volume)
+- Services: redis + gateway + loader only; worker models are loaded dynamically
+- Default bakeoff alias map (`gateway/models.bakeoff.yaml`):
+  - `light` → `Qwen/Qwen3-4B-AWQ` (baseline)
+  - `heavy`/`candidate` → `Qwen/Qwen3-4B-Instruct-2507-AWQ` (first challenger)
+- Purpose: controlled candidate model trials without mutating the primary stack
+
+Production Metrics (2026-02-22 snapshot, 11h window):
+- 6,913 requests total: heavy 5,024 (72.7%), light 1,889 (27.3%)
+- Avg latency: heavy 8.0s, light 5.5s — fleet P50 6.0s (per Codex audit)
+- Prefix cache hit rate: heavy 63%, light 24%
+- 0 errors, 0 queue pressure, 0 KV cache saturation
+- All 4 workers healthy, balanced load (heavy-0:2527, heavy-1:2497, light-0:943, light-1:946)
 
 Key Files:
 - docker-compose.yml — 7 services: redis, heavy-0/1, light-0/1, gateway, loader
+- docker-compose.all-light.yml — 13 services: redis, light-0..9, gateway, loader
+- docker-compose.bakeoff.yml — isolated bakeoff stack (redis, gateway, loader)
 - gateway/main.py — FastAPI, registry routing, streaming, failover, queue, metrics
 - gateway/config.py — WorkerPool (thread-safe round-robin), PoolManager, Settings
 - gateway/registry.py — model discovery, config.json parsing, models.yaml merging
 - gateway/request_queue.py — Redis pub/sub queue for unloaded model requests
 - gateway/models.yaml — per-model overrides (VRAM, aliases, pinned, max_model_len)
+- gateway/models.bakeoff.yaml — bakeoff alias/pinning profile for candidate trials
 - loader/loader.py — Docker SDK container lifecycle, GPU placement, LRU eviction
 - scripts/load_test.py — concurrent load testing tool
 - agents/YAKLOG_GUIDE.md — yaklog inter-agent messaging reference (local-only, gitignored)
+- agents/MODEL_BAKEOFF_RUNBOOK.md — operational runbook for isolated bakeoff trials
 
 Inter-Agent Coordination:
 - yaklog (http://192.168.122.76:3100) — shared context channel for Claude/Codex sessions
@@ -109,14 +144,17 @@ Inter-Agent Coordination:
 
 Implementation Status:
 1. ✅ Foundation — project scaffold, Docker Compose, GPU assignments, Redis
-2. ✅ vLLM Workers — containerized workers for both models, health checks
-3. ✅ API Gateway — FastAPI with OpenAI-compatible endpoints, routing, metrics
+2. ✅ vLLM Workers — containerized workers for both models, health checks, awq_marlin kernel
+3. ✅ API Gateway — FastAPI, OpenAI-compatible API (models, chat, errors), backpressure, least-loaded routing
 4. ✅ Model Registry — auto-discovery, models.yaml overrides, alias resolution
 5. ✅ Loader Service — Docker SDK, GPU-aware placement, health polling, gateway registration
 6. ✅ Request Queue — Redis pub/sub for waiting on unloaded models, auto-load trigger
 7. ✅ GPU Allocator + Eviction — LRU eviction, pinned protection, VRAM reservation
-8. Observability — expand GPU utilization monitoring
-9. Load Testing — benchmark throughput with dynamic loading
+8. ✅ Production Validated — 6,913 requests over 11h, 0 errors, fleet P50 6.0s
+9. ✅ All-Light Config — 10× Qwen3-4B-AWQ workers (5/GPU), "heavy" alias → light pool
+10. ✅ Alias Compatibility Hardening — `/v1/models` publishes alias IDs; `/v1/models/{alias}` resolves alias IDs; chat responses preserve caller-requested model alias for stream + non-stream
+11. ✅ Bakeoff Scaffolding — standalone bakeoff compose/env/model-profile/runbook added for controlled candidate testing
+12. Next: Observability — per-tick `resolved_model` + `worker_id` + `queue_wait_ms`, plus static-worker GPU accounting in loader status path
 
 ---
 

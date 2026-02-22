@@ -1,5 +1,9 @@
 models:
-  # === Production (pinned, aliased) ===
+  # Bakeoff defaults:
+  # - light alias -> baseline low-latency model
+  # - heavy/candidate aliases -> active challenger model
+  # To test a different challenger, move [heavy, candidate] to another model_id.
+
   - model_id: Qwen/Qwen2.5-14B-Instruct-AWQ
     vram_mb: 10400
     kv_reserve_mb: 8000
@@ -10,11 +14,17 @@ models:
   - model_id: Qwen/Qwen3-4B-AWQ
     vram_mb: 2800
     kv_reserve_mb: 4000
-    aliases: [light, heavy]
+    aliases: [light]
     pinned: true
     max_model_len: 16384
 
-  # === Available models ===
+  - model_id: Qwen/Qwen3-4B-Instruct-2507-AWQ
+    vram_mb: 2800
+    kv_reserve_mb: 4000
+    aliases: [heavy, candidate]
+    pinned: false
+    max_model_len: 16384
+
   - model_id: Qwen/Qwen3-8B-AWQ
     vram_mb: 6400
     kv_reserve_mb: 6000
@@ -23,11 +33,6 @@ models:
   - model_id: Qwen/Qwen3-14B-AWQ
     vram_mb: 10440
     kv_reserve_mb: 8000
-    max_model_len: 32768
-
-  - model_id: Qwen/Qwen3-4B-Instruct-2507-AWQ
-    vram_mb: 2800
-    kv_reserve_mb: 4000
     max_model_len: 32768
 
   - model_id: meta-llama/Llama-3.1-8B-Instruct
