@@ -64,7 +64,7 @@ Loader Service (:8001)  ─── 127.0.0.1 only
 Design Decisions (LOCKED):
 - Serving engine: vLLM
 - Model discovery: auto-scan /data/models, merge with models.yaml overrides
-- Default aliases are profile-driven; active runtime (2026-02-22) maps `light` + `heavy` to Qwen3-4B-Instruct-2507-AWQ in one-model-per-GPU profile
+- Default aliases are profile-driven; active runtime (2026-02-26) maps `light` + `heavy` to Qwen3-14B-AWQ across all 4 workers in 14b-4worker profile
 - Available models: 9 vLLM-compatible models on disk (5 AWQ, 4 BF16)
 - Routing: registry-driven alias resolution → least-loaded routing across healthy workers per pool
 - Burst handling: vLLM's continuous batcher absorbs concurrency natively
@@ -91,9 +91,9 @@ Available Models (9 vLLM-compatible):
 - Orion-zhen/Qwen2.5-7B-Instruct-Uncensored: ~15.2GB VRAM, qwen2, BF16
 - thirdeyeai/DeepSeek-R1-Distill-Qwen-14B-uncensored: ~29.6GB VRAM, qwen2, BF16
 
-Alias/pinning are profile-driven from `gateway/models.yaml` (mixed/all-light), `gateway/models.one-model-per-gpu.yaml` (one-model), or `gateway/models.bakeoff.yaml` (bakeoff).
+Alias/pinning are profile-driven from `gateway/models.yaml` (mixed/all-light), `gateway/models.14b-4worker.yaml` (14b-4worker, current), `gateway/models.one-model-per-gpu.yaml` (one-model), or `gateway/models.bakeoff.yaml` (bakeoff).
 
-GPU Allocation — Four Configurations Available:
+GPU Allocation — Five Configurations Available:
 
 Config A (mixed, docker-compose.yml + .env):
 - GPU 0: heavy-0 (14B, 0.50) + light-0 (4B, 0.40) = 90% utilization
@@ -122,32 +122,52 @@ Config D (one-model-per-GPU, docker-compose.one-model-per-gpu.yml + .env.one-mod
 - 32K context enabled (`VLLM_MAX_MODEL_LEN=32768`) with tuned batching (`max_num_seqs=64`, `max_num_batched_tokens=65536`)
 - Switch: docker compose -p sswai -f docker-compose.one-model-per-gpu.yml --env-file .env.one-model-per-gpu up -d
 
+Config E (14b-4worker, docker-compose.14b-4worker.yml + .env.14b-4worker) — CURRENT PROFILE:
+- GPU 0: model-0 + model-1 (Qwen3-14B-AWQ, sequential load, 0.46 gpu-mem-util each)
+- GPU 1: model-2 + model-3 (Qwen3-14B-AWQ, sequential load, 0.46 gpu-mem-util each)
+- 4 workers total, both `light` and `heavy` aliases route to all 4
+- 49,152 token context via YaRN rope scaling (factor 1.2 × native 40,960)
+- max_num_batched_tokens=16,384 (chunked prefill — 48K prompts handled transparently)
+- KV blocks per worker: ~3,600-4,168 (GPU 1 workers larger; GPU 1 has 3GB more VRAM)
+- Switch: ./start-14b-4worker.sh  (starts vLLM + observability together)
+
 Historical Production Metrics (2026-02-22 snapshot, 11h window, mixed-era):
 - 6,913 requests total: heavy 5,024 (72.7%), light 1,889 (27.3%)
 - Avg latency: heavy 8.0s, light 5.5s — fleet P50 6.0s (per Codex audit)
 - Prefix cache hit rate: heavy 63%, light 24%
 - 0 errors, 0 queue pressure, 0 KV cache saturation
-- All 4 workers healthy, balanced load (heavy-0:2527, heavy-1:2497, light-0:943, light-1:946)
 
-Current Runtime Snapshot (2026-02-22 21:14 UTC):
-- Active stack: one-model-per-GPU (project `sswai`)
-- Healthy services: redis + model-0 + model-1 + gateway + loader
-- Gateway `/health`: status=ok, 2/2 workers healthy
-- `/v1/models/status`: Qwen/Qwen3-4B-Instruct-2507-AWQ loaded with 2 healthy workers
-- Alias checks: both `light` and `heavy` chat completions return 200
+Measured Performance — Config E, 14B-4worker (2026-02-25, Prometheus data, 11,603 requests):
+- TTFT p50: 38.9s (under warpack load) / 12.6s (12 agents, light load)
+- E2E p95: 113.9s (under load) / 59.4s (12 agents)
+- Avg prompt tokens: 9,716 | Avg output tokens: 73 | Input:output ratio: 134:1
+- Agents are pure prefill workloads — output is a short JSON action blob
+- Practical agent capacity: 15-18 max (KV-bound at avg prompt size)
+- KV saturated at 100% during 15-agent warpack when model-0 was partially out of pool
+
+Current Runtime Snapshot (2026-02-26):
+- Stack: DOWN — server being physically moved
+- Last active: Config E (14b-4worker), 4/4 workers healthy, 12 agents connected
+- To restart: cd /home/jon/sswai && ./start-14b-4worker.sh
 
 Key Files:
+- start-14b-4worker.sh — start both vLLM + observability stacks (primary entry point)
+- docker-compose.14b-4worker.yml — CURRENT: 4 workers, 2/GPU, YaRN 48K context
+- .env.14b-4worker — CURRENT profile env (gpu_mem_util=0.46, max_model_len=49152, batched_tokens=16384)
+- docker-compose.observability.yml — Prometheus + Grafana, shares sswai_default network
+- prometheus/prometheus.yml — scrapes model-0..3:8000 at 15s interval
+- grafana/dashboards/vllm.json — 12-panel vLLM dashboard (auto-provisioned)
 - docker-compose.yml — 7 services: redis, heavy-0/1, light-0/1, gateway, loader
 - docker-compose.all-light.yml — 13 services: redis, light-0..9, gateway, loader
 - docker-compose.bakeoff.yml — isolated bakeoff stack (redis, gateway, loader)
-- docker-compose.one-model-per-gpu.yml — 5 services: redis, model-0/1, gateway, loader (one static worker per GPU)
-- .env.one-model-per-gpu — one-model profile env (32K context, batching controls, model selection)
+- docker-compose.one-model-per-gpu.yml — 5 services: redis, model-0/1, gateway, loader
 - gateway/main.py — FastAPI, registry routing, streaming, failover, queue, metrics
 - gateway/config.py — WorkerPool (thread-safe round-robin), PoolManager, Settings
 - gateway/registry.py — model discovery, config.json parsing, models.yaml merging
 - gateway/request_queue.py — Redis pub/sub queue for unloaded model requests
 - gateway/models.yaml — per-model overrides (VRAM, aliases, pinned, max_model_len)
-- gateway/models.one-model-per-gpu.yaml — one-model alias/pinning profile (`light` + `heavy` mapped to Qwen3-4B-Instruct-2507-AWQ)
+- gateway/models.14b-4worker.yaml — CURRENT: Qwen3-14B-AWQ pinned, aliases [light, heavy], 49K context
+- gateway/models.one-model-per-gpu.yaml — one-model alias/pinning profile
 - gateway/models.bakeoff.yaml — bakeoff alias/pinning profile for candidate trials
 - loader/loader.py — Docker SDK container lifecycle, GPU placement, LRU eviction
 - scripts/load_test.py — concurrent load testing tool
@@ -173,7 +193,10 @@ Implementation Status:
 11. ✅ Bakeoff Scaffolding — standalone bakeoff compose/env/model-profile/runbook added for controlled candidate testing
 12. ✅ One-Model-Per-GPU Profile — added `docker-compose.one-model-per-gpu.yml` + `.env.one-model-per-gpu` + `gateway/models.one-model-per-gpu.yaml` (32K-ready, one static worker per GPU)
 13. ✅ Runtime Switch Executed — stopped all-light stack and brought up one-model-per-GPU stack; verified health + alias chat responses
-14. Next: Observability — per-tick `resolved_model` + `worker_id` + `queue_wait_ms`, plus static-worker GPU accounting in loader status path
+14. ✅ 14B-4Worker Profile — Qwen3-14B-AWQ × 4 workers (2/GPU), 49,152-token context via YaRN rope scaling (factor 1.2), sequential GPU startup, Config E
+15. ✅ Observability — Prometheus + Grafana auto-provisioned; 12-panel dashboard (TTFT, E2E latency, TPOT, KV cache, throughput, preemptions); 0.0.0.0 bound for ZeroTier access
+16. ✅ Capacity Analysis — measured 14B stack: TTFT p50 38.9s under load, 12.6s at 12 agents; practical max 15-18 agents (KV-bound at avg 9,716 tokens/request); 134:1 input:output ratio confirms pure prefill workload
+17. Next: Combat doctrine update — agents detect hostiles but never engage (audit #82); weapon slot IDs need surfacing in combat context
 
 ---
 
@@ -259,7 +282,7 @@ EXPECTED AREAS OF CONTRIBUTION
 • GPU-aware model placement and LRU eviction
 • Round-robin load balancing with automatic failover
 • Health checking and worker pool management
-• Metrics and observability via Redis
+• Metrics and observability via Redis + Prometheus + Grafana (http://192.168.122.76:3000, admin/sswai)
 • Load testing and capacity validation
 • Model swapping, A/B testing, and multi-model experimentation
 
