@@ -94,14 +94,21 @@ async def _check_worker(pool_name: str, url: str):
     pool = pool_mgr.get_pool(pool_name)
     if pool is None:
         return
+    was_healthy = pool.is_healthy(url)
     try:
         resp = await http_client.get(f"{url}/health", timeout=5.0)
         if resp.status_code == 200:
             pool.mark_healthy(url)
+            if not was_healthy:
+                log.warning("Worker %s RECOVERED (was unhealthy)", url)
         else:
             pool.mark_unhealthy(url)
-    except Exception:
+            failures = pool._consecutive_failures.get(url, 0)
+            log.warning("Worker %s health check failed (status %d, failures=%d/3)", url, resp.status_code, failures)
+    except Exception as e:
         pool.mark_unhealthy(url)
+        failures = pool._consecutive_failures.get(url, 0)
+        log.warning("Worker %s health check failed (error: %s, failures=%d/3)", url, e, failures)
 
     # Scrape vLLM queue depth
     try:

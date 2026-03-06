@@ -16,6 +16,7 @@ class WorkerPool:
         self._index = 0
         self.healthy: set[str] = set(self._urls)
         self._queue_depth: dict[str, int] = {}  # url → running + waiting
+        self._consecutive_failures: dict[str, int] = {}  # url → consecutive health failures
         self._lock = threading.Lock()
 
     def next(self) -> str | None:
@@ -47,10 +48,13 @@ class WorkerPool:
         with self._lock:
             if url in self._urls:
                 self.healthy.add(url)
+                self._consecutive_failures[url] = 0
 
-    def mark_unhealthy(self, url: str) -> None:
+    def mark_unhealthy(self, url: str, threshold: int = 3) -> None:
         with self._lock:
-            self.healthy.discard(url)
+            self._consecutive_failures[url] = self._consecutive_failures.get(url, 0) + 1
+            if self._consecutive_failures[url] >= threshold:
+                self.healthy.discard(url)
 
     def worker_count(self) -> int:
         with self._lock:
