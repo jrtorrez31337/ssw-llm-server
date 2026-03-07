@@ -64,8 +64,8 @@ Loader Service (:8001)  ─── 127.0.0.1 only
 Design Decisions (LOCKED):
 - Serving engine: vLLM
 - Model discovery: auto-scan /data/models, merge with models.yaml overrides
-- Default aliases are profile-driven; active runtime (2026-03-06) maps `light` + `heavy` to Qwen3-32B-AWQ on 2 workers (1/GPU) in 32b-1per-gpu profile (Config F)
-- Available models: 10 vLLM-compatible models on disk (6 AWQ, 4 BF16)
+- Default aliases are profile-driven; active runtime (2026-03-07) maps `light` + `heavy` to Qwen3-30B-A3B MoE AWQ on 2 workers (1/GPU) in 30b-moe profile (Config H)
+- Available models: 10 vLLM-compatible models on disk (6 AWQ, 1 compressed-tensors, 3 BF16)
 - Routing: registry-driven alias resolution → least-loaded routing across healthy workers per pool
 - Burst handling: vLLM's continuous batcher absorbs concurrency natively
 - Redis role: metrics storage only (latency, tokens, error tracking) — request queue only for unloaded model waiting
@@ -81,19 +81,19 @@ Design Decisions (LOCKED):
 - Eviction: LRU among non-pinned models, pinned models never evicted
 - VRAM reservation: atomic reservation during loads to prevent concurrent oversubscription
 
-Available Models (9 vLLM-compatible):
+Available Models (10 vLLM-compatible):
 - Qwen/Qwen2.5-14B-Instruct-AWQ: ~10.4GB VRAM, qwen2, AWQ, hermes parser
 - Qwen/Qwen3-4B-AWQ: ~2.8GB VRAM, qwen3, AWQ, hermes parser
 - Qwen/Qwen3-8B-AWQ: ~6.4GB VRAM, qwen3, AWQ
 - Qwen/Qwen3-14B-AWQ: ~10.4GB VRAM, qwen3, AWQ
 - Qwen/Qwen3-32B-AWQ: ~18.5GB VRAM, qwen3, AWQ, 64 layers, 8 KV heads
 - Qwen/Qwen3-4B-Instruct-2507-AWQ: ~2.8GB VRAM, qwen3, AWQ
+- stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ: ~16GB VRAM, qwen3_moe, compressed-tensors, 128 experts, 8 active/token (PRODUCTION)
 - meta-llama/Llama-3.1-8B-Instruct: ~16GB VRAM, llama, BF16, llama3_json parser
 - mistralai/Mistral-7B-Instruct-v0.2: ~14.8GB VRAM, mistral, BF16, mistral parser
 - Orion-zhen/Qwen2.5-7B-Instruct-Uncensored: ~15.2GB VRAM, qwen2, BF16
-- thirdeyeai/DeepSeek-R1-Distill-Qwen-14B-uncensored: ~29.6GB VRAM, qwen2, BF16
 
-Alias/pinning are profile-driven from `gateway/models.14b-4worker.yaml` (14b-4worker, current), `gateway/models.30b-moe.yaml` (30b-moe), `gateway/models.32b-1per-gpu.yaml` (32b), `gateway/models.yaml` (mixed/all-light), `gateway/models.one-model-per-gpu.yaml` (one-model), or `gateway/models.bakeoff.yaml` (bakeoff).
+Alias/pinning are profile-driven from `gateway/models.30b-moe.yaml` (30b-moe, production), `gateway/models.14b-4worker.yaml` (14b-4worker), `gateway/models.32b-1per-gpu.yaml` (32b), `gateway/models.yaml` (mixed/all-light), `gateway/models.one-model-per-gpu.yaml` (one-model), or `gateway/models.bakeoff.yaml` (bakeoff).
 
 GPU Allocation — Eight Configurations Available:
 
@@ -239,7 +239,7 @@ Three-Way Bakeoff Verdict (E vs F vs H, same code, 12 agents, yaklog infra#137, 
 
 Current Runtime Snapshot (2026-03-07):
 - Stack: Config H RUNNING — systemd-managed, starts on boot (`sswai.service`)
-- Production config: Config H (30B MoE × 2) — bakeoff winner, 2 production runs completed
+- Production config: Config H (30B MoE × 2, 64K context) — bakeoff winner, 3 production runs completed
 - CLI: `./sswai start` / `./sswai stop` / `./sswai health` / `./sswai gpu` / `./sswai metrics` / `./sswai test`
 - Systemd: `sudo systemctl start|stop|status sswai` — enabled at boot
 - Legacy scripts still available: ./start-14b-4worker.sh (E), ./start-32b.sh (F), ./start-30b-moe.sh (H)
