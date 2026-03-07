@@ -192,17 +192,32 @@ Measured Performance — Config F, 32B-1per-gpu (2026-03-06, Prometheus data, 42
 - Prefix cache hit rate: 15.3%
 - 0 aborted, 0 length-exceeded — thinking suppression fix holding
 
-Bakeoff Verdict (Config E vs F, same code, same session, 12 agents):
-- 14B serves 4.1× more requests/hr (1,717 vs 420)
-- 14B is 2.1× faster TTFT avg (27s vs 57s), 1.8× faster E2E avg (43s vs 77s)
-- Both hit KV saturation at 12 agents; 32B per-worker preemption rate is higher
-- 14B wins all infra metrics; 32B quality advantage remains unquantified (no matching behavioral audit)
-- Config E (14B×4) recommended for production
+Measured Performance — Config H, 30B-MoE (2026-03-07, Prometheus data, 2,151 requests):
+- TTFT p50: 10.9s, p95: 51.6s, avg: 15.3s
+- E2E p50: 32.2s, p95: 95.8s, avg: 33.6s
+- Queue avg: 2.1s, Prefill avg: 8.4s, Decode avg: 21.5s, TPOT p50: 82ms
+- Avg prompt: 8,891 | Avg gen: 129 | Ratio: 69:1
+- KV peak: 78.2% (GPU 0), 81.4% (GPU 1) | Preemptions: 1 total
+- Length-exceeded: 150 requests (6.5%) — MoE generates ~2× more output tokens than 14B
+- Prefix cache hit rate: 18.7%
 
-Current Runtime Snapshot (2026-03-06):
-- Stack: DOWN — all containers stopped, both GPUs free
-- Bakeoff complete: Config E (14B) vs Config F (32B) — 14B wins all infra metrics (yaklog infra#132, #134)
-- Config H (30B MoE) staged, untested — next trial candidate
+Three-Way Bakeoff Verdict (E vs F vs H, same code, 12 agents, yaklog infra#137, handoff#138):
+| Metric           | Config E (14B×4) | Config F (32B×2) | Config H (MoE×2) |
+|------------------|------------------|------------------|-------------------|
+| Requests/hr      | 1,717            | 420              | 2,151             |
+| TTFT p50         | 25.2s            | 36.5s            | 10.9s             |
+| E2E avg          | 43.3s            | 77.1s            | 33.6s             |
+| KV peak          | 99.9%            | 100%             | 81.4%             |
+| Preemptions      | 95               | 67               | 1                 |
+| Length-exceeded   | 0                | 0                | 150 (6.5%)        |
+- Config H dominates throughput (1.25× E, 5.1× F) and latency (2.3× faster TTFT than E)
+- Config H has massive KV headroom (81% vs 100%) — can scale to more agents
+- Config H concern: 6.5% length-exceeded rate needs investigation (thinking leak, model verbosity, or max_model_len tuning)
+- Recommendation: Config H (30B MoE) for production, with length-exceeded mitigation as next priority
+
+Current Runtime Snapshot (2026-03-07):
+- Stack: Config H running (30B MoE × 2 workers, idle after bakeoff)
+- Three-way bakeoff complete: Config H wins all infra metrics except length-exceeded (yaklog infra#137, handoff#138)
 - To restart: ./start-14b-4worker.sh (Config E) or ./start-30b-moe.sh (Config H) or ./start-32b.sh (Config F)
 
 Key Files:
@@ -271,7 +286,8 @@ Implementation Status:
 22. ✅ Health Check Resilience — model-3 routing fix: require 3 consecutive health failures before worker exclusion (was instant); added recovery logging; prevents transient timeout under load from permanently dropping a worker
 23. ✅ 30B MoE Profile — Qwen3-30B-A3B-Instruct-2507-AWQ (MoE, 128 experts, 8 active/token) downloaded, Config H fully staged; also evaluated Qwen3.5-27B (blocked: requires vLLM 0.17+, we run 0.11)
 24. ✅ E vs F Bakeoff — same code, same session, 12 agents: 14B serves 4.1× more requests, 2.1× faster TTFT, 1.8× faster E2E; 14B recommended for production (yaklog infra#132, #134, handoff#135)
-25. Next: Config H (30B MoE) trial — test whether MoE expert routing offers quality/speed middle ground between 14B and 32B
+25. ✅ Config H (30B MoE) Trial — 2,151 req/hr, 10.9s TTFT p50, 33.6s E2E avg, 1 preemption; dominates E and F on all infra metrics; 6.5% length-exceeded needs investigation (yaklog infra#137, handoff#138)
+26. Next: Length-exceeded mitigation for Config H — investigate 6.5% rate (150/2,151 requests); options: raise max_model_len, tune thinking suppression, agent behavioral audit under MoE
 
 ---
 
