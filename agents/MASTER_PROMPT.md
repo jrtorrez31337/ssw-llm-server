@@ -216,9 +216,10 @@ Three-Way Bakeoff Verdict (E vs F vs H, same code, 12 agents, yaklog infra#137, 
 - Recommendation: Config H (30B MoE) for production, with length-exceeded mitigation as next priority
 
 Current Runtime Snapshot (2026-03-07):
-- Stack: Config H running (30B MoE × 2 workers, idle after bakeoff)
-- Three-way bakeoff complete: Config H wins all infra metrics except length-exceeded (yaklog infra#137, handoff#138)
-- To restart: ./start-14b-4worker.sh (Config E) or ./start-30b-moe.sh (Config H) or ./start-32b.sh (Config F)
+- Stack: DOWN — all containers stopped, both GPUs free
+- Production config: Config H (30B MoE × 2) — bakeoff winner
+- CLI: `./sswai start` / `./sswai stop` / `./sswai health` / `./sswai gpu` / `./sswai metrics` / `./sswai test`
+- Legacy scripts still available: ./start-14b-4worker.sh (E), ./start-32b.sh (F), ./start-30b-moe.sh (H)
 
 Key Files:
 - start-14b-4worker.sh / stop-14b-4worker.sh — start/stop Config E (14B × 4) + observability
@@ -250,6 +251,7 @@ Key Files:
 - scripts/load_test.py — concurrent load testing tool
 - agents/YAKLOG_GUIDE.md — yaklog inter-agent messaging reference (local-only, gitignored)
 - agents/MODEL_BAKEOFF_RUNBOOK.md — operational runbook for isolated bakeoff trials
+- sswai — production CLI (start/stop/restart/status/health/logs/gpu/metrics/test/config)
 
 Inter-Agent Coordination:
 - yaklog (http://192.168.122.76:3100) — shared context bus for Claude/Codex sessions
@@ -287,7 +289,8 @@ Implementation Status:
 23. ✅ 30B MoE Profile — Qwen3-30B-A3B-Instruct-2507-AWQ (MoE, 128 experts, 8 active/token) downloaded, Config H fully staged; also evaluated Qwen3.5-27B (blocked: requires vLLM 0.17+, we run 0.11)
 24. ✅ E vs F Bakeoff — same code, same session, 12 agents: 14B serves 4.1× more requests, 2.1× faster TTFT, 1.8× faster E2E; 14B recommended for production (yaklog infra#132, #134, handoff#135)
 25. ✅ Config H (30B MoE) Trial — 2,151 req/hr, 10.9s TTFT p50, 33.6s E2E avg, 1 preemption; dominates E and F on all infra metrics; 6.5% length-exceeded needs investigation (yaklog infra#137, handoff#138)
-26. Next: Length-exceeded mitigation for Config H — investigate 6.5% rate (150/2,151 requests); options: raise max_model_len, tune thinking suppression, agent behavioral audit under MoE
+26. ✅ Production CLI — unified `./sswai` script (start/stop/restart/status/health/logs/gpu/metrics/test/config) wired to Config H
+27. Next: Length-exceeded mitigation for Config H — investigate 6.5% rate (150/2,151 requests); options: raise max_model_len, tune thinking suppression, agent behavioral audit under MoE
 
 ---
 

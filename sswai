@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# sswai — production CLI for SSW AI inference platform
+#
+# Usage:
+#   ./sswai start [--no-obs]    Start production stack (30B MoE × 2) + observability
+#   ./sswai stop                Stop all services
+#   ./sswai restart [--no-obs]  Stop then start
+#   ./sswai status              Container status table
+#   ./sswai health              Health check all endpoints
+#   ./sswai logs [SERVICE]      Tail logs (all or specific service)
+#   ./sswai gpu                 GPU utilization snapshot
+#   ./sswai metrics             Key vLLM metrics from Prometheus
+#   ./sswai test [N]            Quick smoke test (N requests, default 3)
+#   ./sswai config              Show active configuration
+#
+# Production config: Config H (Qwen3-30B-A3B MoE AWQ, 2 workers, 1/GPU)
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# --- Configuration ---
+COMPOSE_FILE="docker-compose.30b-moe.yml"
+OBS_COMPOSE_FILE="docker-compose.observability.yml"
+ENV_FILE=".env.30b-moe"
+PROM_CONFIG="prometheus/prometheus.30b-moe.yml"
+PROJECT="sswai"
+GATEWAY_PORT=8000
+PROM_PORT=9090
+GRAFANA_PORT=3000
+PROFILE_NAME="Config H — Qwen3-30B-A3B MoE AWQ × 2 workers (1/GPU), 48K context"
+
+# --- Helpers ---
+compose() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+compose_all() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" -f "$OBS_COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+compose_obs() {
+  docker compose -p "$PROJECT" -f "$OBS_COMPOSE_FILE" "$@"
+}
+
+print_endpoints() {
+  echo ""
+  echo "Endpoints:"
+  echo "  Gateway     http://localhost:${GATEWAY_PORT}"
+  echo "  Prometheus  http://localhost:${PROM_PORT}"
+  echo "  Grafana     http://localhost:${GRAFANA_PORT}  (admin / sswai)"
+}
+
+# --- Commands ---
+cmd_start() {
+  local obs=true
+  for arg in "$@"; do
+    [[ "$arg" == "--no-obs" ]] && obs=false
+  done
+
+  cp "$PROM_CONFIG" prometheus/prometheus.yml
+
+  echo "==> Starting production stack  ($PROFILE_NAME)..."
+  compose up -d
+
+  if $obs; then
+    echo "==> Starting observability  (Prometheus + Grafana)..."
+    compose_obs up -d
+  fi
+
+  echo ""
+  echo "Stack starting. Run './sswai health' to verify."
+  if $obs; then
+    print_endpoints
+  else
+    echo ""
+    echo "Endpoints:"
+    echo "  Gateway  http://localhost:${GATEWAY_PORT}"
+  fi
+}
+
+cmd_stop() {
+  echo "==> Stopping all ${PROJECT} services..."
+  compose_all down
+  echo "All services stopped."
+}
+
+cmd_restart() {
+  cmd_stop
+  echo ""
+  cmd_start "$@"
+}
+
+cmd_status() {
+  echo "==> Container status:"
+  compose_all ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+}
+
+cmd_health() {
+  echo "==> Health checks:"
+  local all_ok=true
+
+  # Gateway
+  printf "  %-14s" "Gateway"
+  if curl -sf "http://localhost:${GATEWAY_PORT}/health" -o /dev/null --max-time 5 2>/dev/null; then
+    echo "OK"
+  else
+    echo "FAIL"
+    all_ok=false
+  fi
+
+  # Model workers — probe via gateway /v1/models
+  printf "  %-14s" "Models"
+  local models
+  if models=$(curl -sf "http://localhost:${GATEWAY_PORT}/v1/models" --max-time 5 2>/dev/null); then
+    local count
+    count=$(echo "$models" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "?")
+    echo "OK  ($count models loaded)"
+  else
+    echo "FAIL"
+    all_ok=false
+  fi
+
+  # Prometheus
+  printf "  %-14s" "Prometheus"
+  if curl -sf "http://localhost:${PROM_PORT}/-/healthy" -o /dev/null --max-time 3 2>/dev/null; then
+    echo "OK"
+  else
+    echo "DOWN"
+  fi
+
+  # Grafana
+  printf "  %-14s" "Grafana"
+  if curl -sf "http://localhost:${GRAFANA_PORT}/api/health" -o /dev/null --max-time 3 2>/dev/null; then
+    echo "OK"
+  else
+    echo "DOWN"
+  fi
+
+  echo ""
+  if $all_ok; then
+    echo "All core services healthy."
+  else
+    echo "Some services unhealthy — check './sswai logs' for details."
+  fi
+}
+
+cmd_logs() {
+  if [[ $# -gt 0 ]]; then
+    compose_all logs -f --tail=100 "$@"
+  else
+    compose_all logs -f --tail=50
+  fi
+}
+
+cmd_gpu() {
+  echo "==> GPU utilization:"
+  nvidia-smi --query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu \
+    --format=csv,noheader,nounits | \
+    awk -F', ' '{printf "  GPU %s  %-16s  Util: %3s%%  MemUtil: %3s%%  VRAM: %6s / %6s MiB  Temp: %s°C\n", $1, $2, $3, $4, $5, $6, $7}'
+}
+
+cmd_metrics() {
+  echo "==> Key vLLM metrics (from Prometheus):"
+  local prom="http://localhost:${PROM_PORT}"
+
+  # Check Prometheus is up
+  if ! curl -sf "${prom}/-/healthy" -o /dev/null --max-time 3 2>/dev/null; then
+    echo "  Prometheus not reachable at ${prom}"
+    return 1
+  fi
+
+  _prom_query() {
+    local label="$1" query="$2" fmt="${3:-%s}"
+    local encoded val
+    encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$query'''))" 2>/dev/null)
+    val=$(curl -sf "${prom}/api/v1/query?query=${encoded}" --max-time 5 2>/dev/null \
+      | python3 -c "import sys,json; r=json.load(sys.stdin)['data']['result']; print(r[0]['value'][1] if r else 'N/A')" 2>/dev/null || echo "err")
+    printf "  %-28s ${fmt}\n" "$label" "$val"
+  }
+
+  _prom_query "Requests (total)" "sum(vllm:request_success_total)"
+  _prom_query "TTFT p50 (s)" 'histogram_quantile(0.50, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))' "%.1f"
+  _prom_query "E2E latency avg (s)" 'sum(rate(vllm:e2e_request_latency_seconds_sum[5m])) / sum(rate(vllm:e2e_request_latency_seconds_count[5m]))' "%.1f"
+  _prom_query "KV cache util (%)" 'avg(vllm:gpu_cache_usage_perc) * 100' "%.1f"
+  _prom_query "Running requests" "sum(vllm:num_requests_running)"
+  _prom_query "Waiting requests" "sum(vllm:num_requests_waiting)"
+  _prom_query "Preemptions (total)" "sum(vllm:num_preemptions_total)"
+}
+
+cmd_test() {
+  local n=${1:-3}
+  echo "==> Smoke test: ${n} requests to gateway..."
+
+  local pass=0 fail=0
+  for i in $(seq 1 "$n"); do
+    printf "  [%d/%d] " "$i" "$n"
+    local resp
+    if resp=$(curl -sf "http://localhost:${GATEWAY_PORT}/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      --max-time 120 \
+      -d '{"model":"light","messages":[{"role":"user","content":"Say OK in one word."}],"max_tokens":5}' 2>/dev/null); then
+      local content
+      content=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'][:50])" 2>/dev/null || echo "?")
+      echo "OK  -> $content"
+      ((pass++))
+    else
+      echo "FAIL"
+      ((fail++))
+    fi
+  done
+
+  echo ""
+  echo "Results: ${pass} passed, ${fail} failed out of ${n}"
+}
+
+cmd_config() {
+  echo "==> Active production configuration:"
+  echo "  Profile:    $PROFILE_NAME"
+  echo "  Compose:    $COMPOSE_FILE"
+  echo "  Env:        $ENV_FILE"
+  echo "  Prometheus: $PROM_CONFIG"
+  echo ""
+  echo "  Environment:"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+    echo "    $line"
+  done < "$ENV_FILE"
+}
+
+# --- Main dispatch ---
+case "${1:-help}" in
+  start)   shift; cmd_start "$@" ;;
+  stop)    cmd_stop ;;
+  restart) shift; cmd_restart "$@" ;;
+  status)  cmd_status ;;
+  health)  cmd_health ;;
+  logs)    shift; cmd_logs "$@" ;;
+  gpu)     cmd_gpu ;;
+  metrics) cmd_metrics ;;
+  test)    shift; cmd_test "$@" ;;
+  config)  cmd_config ;;
+  help|--help|-h)
+    echo "sswai — SSW AI inference platform CLI"
+    echo ""
+    echo "Usage: ./sswai <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  start [--no-obs]    Start production stack + observability"
+    echo "  stop                Stop all services"
+    echo "  restart [--no-obs]  Stop then start"
+    echo "  status              Container status table"
+    echo "  health              Health check all endpoints"
+    echo "  logs [SERVICE]      Tail logs (all or specific: model-0, gateway, etc.)"
+    echo "  gpu                 GPU utilization snapshot"
+    echo "  metrics             Key vLLM metrics from Prometheus"
+    echo "  test [N]            Smoke test (N requests, default 3)"
+    echo "  config              Show active configuration"
+    echo ""
+    echo "Active profile: $PROFILE_NAME"
+    ;;
+  *)
+    echo "Unknown command: $1"
+    echo "Run './sswai help' for usage."
+    exit 1
+    ;;
+esac
